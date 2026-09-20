@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "defaults": {
+    "engine": "cursor",
+    "host": "auto"
+  },
+  "hosts": {
+    "claude": {
+      "aliases": ["cc", "claude-code", "anthropic"],
+      "skill_install": "~/.claude/skills/call",
+      "wake": "run_in_background"
+    },
+    "codex": {
+      "aliases": ["cx", "openai-codex"],
+      "skill_install": "~/.agents/skills/call",
+      "wake": "exec_command_write_stdin"
+    },
+    "kimi": {
+      "aliases": ["km", "kimi-code"],
+      "skill_install": "~/.kimi-code/skills/call",
+      "wake": "stop_hook_or_shell"
+    }
+  },
+  "engines": {
+    "codex": {
+      "aliases": ["cx-engine", "gpt", "oai"],
+      "label": "cx",
+      "runners": {
+        "default": ["${CALL_IN_TMUX_ROOT}/engines/codex/codex-tmux"]
+      }
+    },
+    "cursor": {
+      "aliases": ["cu", "agent", "cursor-agent"],
+      "label": "cxcu",
+      "runners": {
+        "default": ["${CALL_IN_TMUX_ROOT}/engines/cursor/cursor-tmux"]
+      }
+    },
+    "kimi": {
+      "aliases": ["km", "moonshot"],
+      "label": "km",
+      "runners": {
+        "claude": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cc/kimi-tmux"],
+        "codex": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cx/kimi-tmux"],
+        "kimi": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cc/kimi-tmux"],
+        "default": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cc/kimi-tmux"]
+      }
+    }
+  },
+  "edges": [
+    ["claude", "codex"],
+    ["claude", "cursor"],
+    ["claude", "kimi"],
+    ["codex", "cursor"],
+    ["codex", "kimi"],
+    ["kimi", "cursor"]
+  ],
+  "notes": {
+    "self_contained": "All runners live under engines/; no dependency on sibling cx-*/cc-* checkouts at runtime.",
+    "kimi variants": "claude/kimi hosts use engines/kimi/cc (KIMI_TMUX_*); codex host uses engines/kimi/cx (CX_KIMI_TMUX_*)."
+  }
+}

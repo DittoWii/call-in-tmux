@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# call-in-tmux — unified host→engine dispatcher for agent-to-agent calls over tmux.
+# Engines stay specialized; this CLI only routes by matrix edges.
+set -euo pipefail
+
+SELF=$(realpath -m -- "$0" 2>/dev/null || printf '%s' "$0")
+ROOT=$(cd -- "$(dirname -- "$SELF")/.." && pwd)
+export CALL_IN_TMUX_ROOT="$ROOT"
+# workspace = parent of this repo by default (sibling cc-/cx- projects)
+export CALL_IN_TMUX_WORKSPACE="${CALL_IN_TMUX_WORKSPACE:-$(dirname -- "$ROOT")}"
+
+# shellcheck source=../lib/common.sh
+. "$ROOT/lib/common.sh"
+
+MATRIX=$(cit_matrix_file)
+[ -f "$MATRIX" ] || cit_die "找不到 matrix: $MATRIX"
+
+usage() {
+    cat <<'EOF'
+call-in-tmux — 在支持的宿主×引擎矩阵上派发任务（tmux 可视 / 无头降级）。
+
+用法:
+  call-in-tmux to <engine> [dispatch flags...] [-- engine-native-flags...]
+  call-in-tmux list [--to ENGINE]
+  call-in-tmux kill [--to ENGINE] <TITLE|%PANE|done|all>
+  call-in-tmux doctor [--to ENGINE] [--live]
+  call-in-tmux matrix
+  call-in-tmux resolve <engine> [--from HOST]
+  call-in-tmux which
+
+Dispatch flags (转发给引擎,统一契约):
+  -t TITLE  -o REPORT  -C DIR  --brief FILE  --resume ID
+  --target %PANE  -w  --close  --timeout S  --allow-last-message
+
+环境:
+  CALL_IN_TMUX_HOST=claude|codex|kimi   显式宿主(否则自动探测)
+  CALL_IN_TMUX_MATRIX=/path/matrix.json 覆盖矩阵
+  CALL_IN_TMUX_WORKSPACE=/path          旁路仓库根(默认本仓库的上一级)
+
+当前默认矩阵边:
+  claude → codex|cursor|kimi
+  codex  → cursor|kimi
+  kimi   → cursor
+EOF
+}
+
+resolve_name() { # $1=host|engine $2=raw
+    local kind="$1" raw="$2" out
+    out=$(cit_json_py "$MATRIX" "resolve_$kind" "$raw") || cit_die "未知$kind: $raw"
+    printf '%s' "$out"
+}
+
+resolve_runner() {
+    local host="$1" engine="$2" cand runner
+    mapfile -t cand < <(cit_json_py "$MATRIX" runners "$host" "$engine")
+    runner=$(cit_first_existing "${cand[@]}") || {
+        echo "call-in-tmux: 未找到引擎 '$engine' 的可执行文件(host=$host)。候选:" >&2
+        printf '  %s\n' "${cand[@]}" >&2
+        exit 2
+    }
+    printf '%s' "$runner"
+}
+
+ensure_edge() {
+    local host="$1" engine="$2"
+    if ! cit_json_py "$MATRIX" edge_ok "$host" "$engine"; then
+        echo "call-in-tmux: 不支持的边 $host → $engine" >&2
+        echo "已启用的边:" >&2
+        cit_json_py "$MATRIX" edges | awk -F'\t' '{printf "  %s → %s\n", $1, $2}' >&2
+        exit 2
+    fi
+}
+
+cmd_matrix() {
+    echo "matrix: $MATRIX"
+    echo "workspace: $CALL_IN_TMUX_WORKSPACE"
+    echo
+    echo "edges:"
+    cit_json_py "$MATRIX" edges | awk -F'\t' '{printf "  %s → %s\n", $1, $2}'
+    echo
+    echo "engines:"
+    local e aliases host runner
+    while IFS=$'\t' read -r e aliases; do
+        printf '  %s' "$e"
+        [ -n "$aliases" ] && printf ' (aliases: %s)' "$aliases"
+        printf '\n'
+        for host in claude codex kimi; do
+            if cit_json_py "$MATRIX" edge_ok "$host" "$e" 2>/dev/null; then
+                if runner=$(resolve_runner "$host" "$e" 2>/dev/null); then
+                    printf '    %-7s %s\n' "$host:" "$runner"
+                else
+                    printf '    %-7s (runner missing)\n' "$host:"
+                fi
+            fi
+        done
+    done < <(cit_json_py "$MATRIX" engines)
+}
+
+cmd_resolve() {
+    local raw="${1:-}" host_raw="auto" host engine runner
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from) host_raw="$2"; shift 2 ;;
+            *) cit_die "resolve: 未知参数 $1" ;;
+        esac
+    done
+    [ -n "$raw" ] || cit_die "resolve 需要 <engine>"
+    engine=$(resolve_name engine "$raw")
+    if [ "$host_raw" = auto ]; then
+        host=$(cit_detect_host)
+        [ "$host" != auto ] || cit_die "无法探测宿主;请传 --from 或设置 CALL_IN_TMUX_HOST"
+    else
+        host=$(resolve_name host "$host_raw")
+    fi
+    ensure_edge "$host" "$engine"
+    runner=$(resolve_runner "$host" "$engine")
+    printf 'host=%s\nengine=%s\nrunner=%s\nwake=%s\n' \
+        "$host" "$engine" "$runner" "$(cit_json_py "$MATRIX" wake "$host")"
+}
+
+cmd_which() {
+    echo "CALL_IN_TMUX_ROOT=$CALL_IN_TMUX_ROOT"
+    echo "CALL_IN_TMUX_WORKSPACE=$CALL_IN_TMUX_WORKSPACE"
+    echo "matrix=$MATRIX"
+    echo "detected_host=$(cit_detect_host)"
+    echo "self=$SELF"
+}
+
+pick_host() {
+    local host_raw="${1:-}"
+    local host
+    if [ -n "$host_raw" ] && [ "$host_raw" != auto ]; then
+        resolve_name host "$host_raw"
+        return 0
+    fi
+    host=$(cit_detect_host)
+    if [ "$host" = auto ]; then
+        # Prefer explicit env; otherwise leave unknown — caller must pass --from for edge check
+        # For management commands (list/kill), host less critical; use codex as neutral default for kimi runner pick.
+        printf 'codex'
+        return 0
+    fi
+    printf '%s' "$host"
+}
+
+forward_engine() {
+    local host="$1" engine="$2"
+    shift 2
+    local runner
+    ensure_edge "$host" "$engine"
+    runner=$(resolve_runner "$host" "$engine")
+    echo "[call-in-tmux] $host → $engine via $runner" >&2
+    exec bash "$runner" "$@"
+}
+
+cmd_to() {
+    local raw="${1:-}" host_raw="${CALL_IN_TMUX_HOST:-auto}" engine host
+    [ -n "$raw" ] || cit_die "缺少引擎名;见 call-in-tmux matrix"
+    shift
+    local -a passthrough=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from) host_raw="$2"; shift 2 ;;
+            --) shift; passthrough+=("$@"); break ;;
+            *) passthrough+=("$1"); shift ;;
+        esac
+    done
+    engine=$(resolve_name engine "$raw")
+    if [ "$host_raw" = auto ]; then
+        host=$(cit_detect_host)
+        [ "$host" != auto ] || cit_die "无法探测宿主;请传 --from claude|codex|kimi 或设置 CALL_IN_TMUX_HOST"
+    else
+        host=$(resolve_name host "$host_raw")
+    fi
+    # Codex engine often expects effort flag from skill; leave to skill/passthrough.
+    forward_engine "$host" "$engine" "${passthrough[@]}"
+}
+
+cmd_mgmt() {
+    local action="$1"; shift
+    local to="" host engine
+    local -a rest=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --to|--engine) to="$2"; shift 2 ;;
+            --from) CALL_IN_TMUX_HOST="$2"; shift 2 ;;
+            *) rest+=("$1"); shift ;;
+        esac
+    done
+    host=$(pick_host "${CALL_IN_TMUX_HOST:-auto}")
+    if [ -n "$to" ]; then
+        engine=$(resolve_name engine "$to")
+        forward_engine "$host" "$engine" "$action" "${rest[@]}"
+    fi
+    # No --to: fan-out list across known engines for this host's edges
+    if [ "$action" = list ]; then
+        local e runner
+        while IFS=$'\t' read -r _h e; do
+            [ "$_h" = "$host" ] || continue
+            if runner=$(resolve_runner "$host" "$e" 2>/dev/null); then
+                echo "### $host → $e ($runner)"
+                bash "$runner" list || true
+                echo
+            fi
+        done < <(cit_json_py "$MATRIX" edges)
+        return 0
+    fi
+    cit_die "$action 需要 --to <engine>(kill/doctor 需明确引擎)"
+}
+
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        ""|-h|--help) usage; exit 0 ;;
+        to|call|dispatch) shift; cmd_to "$@" ;;
+        list|ls) shift; cmd_mgmt list "$@" ;;
+        kill|close|rm) shift; cmd_mgmt kill "$@" ;;
+        doctor|check) shift; cmd_mgmt doctor "$@" ;;
+        matrix|edges) cmd_matrix ;;
+        resolve) shift; cmd_resolve "$@" ;;
+        which) cmd_which ;;
+        # Convenience: `call-in-tmux cursor ...` == `to cursor`
+        cursor|kimi|codex|cu|km|cx|agent)
+            cmd_to "$@"
+            ;;
+        *)
+            cit_die "未知命令 $cmd(试 call-in-tmux --help)"
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,1334 @@
+#!/usr/bin/env bash
+# cx-kimi-tmux — 在 tmux pane/window 中运行可视 Kimi Code TUI,以 Stop hook 交付结果。
+# Adapted from DittoWii/cc-kimi-tmux, commit 38ced759ac12702e5baebfd801561b977f9bbbec.
+# Copyright notices and MIT terms: ../../../LICENSE; changes: ../../../UPSTREAM.md.
+# 默认面向已有外部隔离边界的自动化环境:以 --auto 姿态启动,免审批免追问。
+
+set -u
+umask 077
+
+SELF=$(realpath -m -- "$0" 2>/dev/null || printf '%s' "$0")
+REG_DIR="${CX_KIMI_TMUX_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/cx-kimi-tmux}"
+REG="$REG_DIR/registry.tsv"       # pane_id, title, report, cwd, started, color
+SESS="$REG_DIR/sessions.tsv"      # session_id, cwd, report, epoch, mode
+WATCH_DIR="$REG_DIR/watch"        # <session_id> -> report 路径(hook 的无 env 兜底)
+REG_LOCK="$REG_DIR/registry.lock"
+KM_COLORS=(colour45 colour171 colour118 colour214 colour87 colour203 colour155 colour208)
+KM_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+
+die() { echo "cx-kimi-tmux: $*" >&2; exit 2; }
+
+usage() {
+    cat <<'EOF'
+cx-kimi-tmux — 在 tmux pane/window 中运行可视 Kimi TUI,并用 Stop hook 自动交付。
+
+用法:
+  cx-kimi-tmux -t TITLE -o REPORT [-C DIR] [--brief FILE] [--timeout S] [--close] [--] [KIMI FLAGS]
+  cx-kimi-tmux --resume <SESSION_ID|last> -t TITLE -o REPORT [--brief FILE] [--] [KIMI FLAGS]
+  cx-kimi-tmux list
+  cx-kimi-tmux kill <TITLE|%PANE|done|all>
+  cx-kimi-tmux doctor [--live]      自检:依赖 / hook 注入 / provider 与端点连通性
+  --target %PANE                显式指定要在旁边分窗的 tmux pane (Codex app 可用)
+
+自动化默认值:
+  CX_KIMI_TMUX_APPROVAL=auto     auto=--auto 全自动;yolo=-y 仅免审批;manual=原生交互
+  CX_KIMI_TMUX_REQUIRE_REPORT=1  TUI 仅在 REPORT 非空后交付;缺失时标记"待输入"并继续等待
+  CX_KIMI_TMUX_MODE=pane         pane | window | exec
+  CX_KIMI_TMUX_ENV_FILE=<路径>    给被派发的 kimi 追加/覆盖环境(最后 source);alias 传不进去时用它
+EOF
+}
+
+tsv_safe() {
+    case "$1" in *$'\t'*|*$'\n'*|*$'\r'*) return 1 ;; *) return 0 ;; esac
+}
+
+atomic_write() { # stdin -> $1
+    local dest="$1" tmp="${1}.tmp.$$"
+    (umask 077; cat > "$tmp") || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$dest"
+}
+
+atomic_copy() {
+    local src="$1" dest="$2" tmp="${2}.tmp.$$"
+    (umask 077; cp -- "$src" "$tmp") || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$dest"
+}
+
+atomic_touch() {
+    local dest="$1" tmp="${1}.tmp.$$"
+    (umask 077; : > "$tmp") || return 1
+    mv -f -- "$tmp" "$dest"
+}
+
+write_state() {
+    local report="$1" state="$2" detail="${3:-}" tmp="${1}.state.tmp.$$"
+    detail=${detail//$'\t'/ }
+    detail=${detail//$'\n'/ }
+    detail=${detail//$'\r'/ }
+    (umask 077; printf '%s\t%s\t%s\n' "$state" "$(date +%s)" "$detail" > "$tmp") || return 1
+    mv -f -- "$tmp" "$report.state"
+}
+
+read_state() {
+    local report="$1" state=""
+    if [ -s "$report.state" ]; then IFS=$'\t' read -r state _ < "$report.state" || true; fi
+    printf '%s' "$state"
+}
+
+derive_evidence() {
+    case "$1" in
+        *.report.md) printf '%s.evidence.md' "${1%.report.md}" ;;
+        *)           printf '%s.evidence.md' "$1" ;;
+    esac
+}
+
+# workdir bucket 键:wd_<slug(basename)>_<sha256(workdir)前12位>
+# slug 规则(2026-08-22 对 kimi 0.38.0 实测):basename 转小写,再把 [a-z0-9._-] 之外的
+# 连续字符压成一个 '-'。举证:`/work/CodeTest` -> wd_codetest_...,
+# `My-Proj.v2 Test` -> wd_my-proj.v2-test_...,`A_b+C@d 中文 e` -> wd_a_b-c-d-e_...
+# 漏掉这一步会让带大写/空格的工作目录同时踩两个坑:信任标记预置落空(弹窗默认项是
+# "Don't trust"=退出),以及 session bucket 找不到 wire.jsonl(启动确认与最后消息兜底双失效)。
+wd_key() {
+    local base slug
+    base=$(basename -- "$1"); [ -n "$base" ] || base=root
+    slug=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]\{1,\}/-/g')
+    [ -n "$slug" ] || slug=root
+    printf 'wd_%s_%s' "$slug" "$(printf '%s' "$1" | sha256sum | cut -c1-12)"
+}
+
+# ---------- registry/session lock ----------
+REG_LOCK_KIND="" REG_LOCK_FD="" REG_LOCK_DIR="${REG_LOCK}.d"
+
+reg_lock_acquire() {
+    mkdir -p -- "$REG_DIR" || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec {REG_LOCK_FD}>"$REG_LOCK" || return 1
+        flock "$REG_LOCK_FD" || return 1
+        REG_LOCK_KIND=flock
+        return 0
+    fi
+
+    local i owner
+    for ((i=0; i<200; i++)); do
+        if mkdir "$REG_LOCK_DIR" 2>/dev/null; then
+            (umask 077; printf '%s\n' "$$" > "$REG_LOCK_DIR/pid")
+            REG_LOCK_KIND=mkdir
+            return 0
+        fi
+        owner=""
+        [ -r "$REG_LOCK_DIR/pid" ] && read -r owner < "$REG_LOCK_DIR/pid" || true
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -f -- "$REG_LOCK_DIR/pid"
+            rmdir "$REG_LOCK_DIR" 2>/dev/null || true
+        fi
+        sleep 0.05
+    done
+    echo "cx-kimi-tmux: registry lock 超时" >&2
+    return 1
+}
+
+reg_lock_release() {
+    case "$REG_LOCK_KIND" in
+        flock)
+            flock -u "$REG_LOCK_FD" 2>/dev/null || true
+            exec {REG_LOCK_FD}>&-
+            ;;
+        mkdir)
+            rm -f -- "$REG_LOCK_DIR/pid"
+            rmdir "$REG_LOCK_DIR" 2>/dev/null || true
+            ;;
+    esac
+    REG_LOCK_KIND="" REG_LOCK_FD=""
+}
+
+reg_prune_unlocked() {
+    [ -s "$REG" ] || return 0
+    local live tmp="${REG}.tmp.$$"
+    if ! live=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null); then
+        return 0                    # tmux 暂不可达时保留登记,不能误清空
+    fi
+    awk -F'\t' -v live="$live" \
+        'BEGIN{n=split(live,a,"\n");for(i=1;i<=n;i++)L[a[i]]=1} ($1 in L)' \
+        "$REG" > "$tmp" 2>/dev/null || : > "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$REG"
+}
+
+reg_prune() {
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    reg_lock_release
+}
+
+reg_snapshot() {
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    [ -s "$REG" ] && cat "$REG"
+    reg_lock_release
+}
+
+reg_add() {
+    local pane="$1" title="$2" report="$3" cwd="$4" started="$5" color="$6"
+    local tmp="${REG}.tmp.$$"
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    if [ -s "$REG" ]; then
+        awk -F'\t' -v p="$pane" -v r="$report" '$1!=p && $3!=r' "$REG" > "$tmp"
+    else
+        : > "$tmp"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$title" "$report" "$cwd" "$started" "$color" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$REG"
+    reg_lock_release
+}
+
+# 由 report 反查 pane(供 hook 使用)
+pane_for_report() {
+    local report="$1"
+    reg_lock_acquire || return 1
+    [ -s "$REG" ] && awk -F'\t' -v r="$report" '$3==r{print $1; exit}' "$REG"
+    reg_lock_release
+}
+
+color_for_report() {
+    local report="$1"
+    reg_lock_acquire || return 1
+    [ -s "$REG" ] && awk -F'\t' -v r="$report" '$3==r{print $6; exit}' "$REG"
+    reg_lock_release
+}
+
+report_in_use() {
+    local report="$1" found=1
+    reg_lock_acquire || return 0
+    reg_prune_unlocked
+    if [ -s "$REG" ] && awk -F'\t' -v r="$report" '$3==r{found=1} END{exit !found}' "$REG"; then found=0; fi
+    reg_lock_release
+    return "$found"
+}
+
+session_update() {
+    local sid="$1" cwd="$2" report="$3" mode="$4" tmp="${SESS}.tmp.$$"
+    [ -n "$sid" ] || return 0
+    tsv_safe "$sid" && tsv_safe "$cwd" && tsv_safe "$report" || return 0
+    reg_lock_acquire || return 1
+    if [ -s "$SESS" ]; then awk -F'\t' -v id="$sid" '$1!=id' "$SESS" > "$tmp"; else : > "$tmp"; fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$report" "$(date +%s)" "$mode" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$SESS"
+    reg_lock_release
+}
+
+session_lookup() {
+    local id="$1"
+    reg_lock_acquire || return 1
+    [ -s "$SESS" ] && awk -F'\t' -v id="$id" '$1==id{line=$0} END{if(line!="")print line}' "$SESS"
+    reg_lock_release
+}
+
+session_last() {
+    reg_lock_acquire || return 1
+    [ -s "$SESS" ] && tail -n 1 "$SESS"
+    reg_lock_release
+}
+
+# ---------- JSON payload helpers ----------
+JSON_ENGINE=""
+choose_json_engine() {
+    [ -n "$JSON_ENGINE" ] && return 0
+    if command -v node >/dev/null 2>&1; then JSON_ENGINE=node
+    elif command -v python3 >/dev/null 2>&1; then JSON_ENGINE=python3
+    elif command -v jq >/dev/null 2>&1; then JSON_ENGINE=jq
+    else return 1
+    fi
+}
+
+# 单行的扁平 JSON(Stop hook 载荷)取标量;多引擎降级,最后 grep 兜底
+json_scalar() {
+    local src="$1" key="$2"; choose_json_engine || JSON_ENGINE=grep
+    case "$JSON_ENGINE" in
+        node) node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(String(j[process.argv[2]]??""))' "$src" "$key" ;;
+        python3) python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); v=j.get(sys.argv[2],""); sys.stdout.write(str(v if v is not None else ""))' "$src" "$key" ;;
+        jq) jq -r --arg k "$key" '.[$k] // empty' "$src" ;;
+        grep) grep -o "\"$key\":\"[^\"]*\"" "$src" 2>/dev/null | head -1 | sed "s/^\"$key\":\"//;s/\"\$//" ;;
+    esac
+}
+
+# exec 模式:从 stream-json 事件流提取最终助手消息
+exec_extract_last() {
+    local events="$1" dest="$2" tmp="${2}.tmp.$$"; choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node)
+            node -e 'let last="";for(const ln of require("fs").readFileSync(process.argv[1],"utf8").split("\n")){if(!ln)continue;try{const j=JSON.parse(ln);if(j.role==="assistant"&&typeof j.content==="string"&&j.content)last=j.content}catch{}}process.stdout.write(last)' "$events" > "$tmp"
+            ;;
+        python3)
+            python3 -c 'import json,sys; last=""
+for ln in open(sys.argv[1],errors="replace"):
+    ln=ln.strip()
+    if not ln: continue
+    try: j=json.loads(ln)
+    except Exception: continue
+    if j.get("role")=="assistant" and isinstance(j.get("content"),str) and j["content"]: last=j["content"]
+sys.stdout.write(last)' "$events" > "$tmp"
+            ;;
+        jq)
+            jq -rs '[.[] | select(.role=="assistant") | .content // empty] | last // empty' "$events" > "$tmp"
+            ;;
+    esac || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
+# exec 模式:从 stream-json 事件流取 session.resume_hint 里的 session_id
+exec_extract_sid() {
+    local events="$1"; choose_json_engine || JSON_ENGINE=grep
+    case "$JSON_ENGINE" in
+        node) node -e 'let s="";for(const ln of require("fs").readFileSync(process.argv[1],"utf8").split("\n")){try{const j=JSON.parse(ln);if(j.type==="session.resume_hint"&&j.session_id)s=j.session_id}catch{}}process.stdout.write(s)' "$events" ;;
+        python3) python3 -c 'import json,sys; s=""
+for ln in open(sys.argv[1],errors="replace"):
+    try: j=json.loads(ln)
+    except Exception: continue
+    if j.get("type")=="session.resume_hint": s=j.get("session_id",s)
+sys.stdout.write(s)' "$events" ;;
+        jq) jq -r 'select(.type=="session.resume_hint") | .session_id // empty' "$events" 2>/dev/null | tail -1 ;;
+        grep) grep -o '"session_id":"[^"]*"' "$events" 2>/dev/null | tail -1 | sed 's/^"session_id":"//;s/"$//' ;;
+    esac
+}
+
+# TUI 兜底:从 wire.jsonl 提取最后一条助手文本(part.type=="text")
+wire_extract_last() {
+    local wire="$1" dest="$2" tmp="${2}.tmp.$$"
+    choose_json_engine || return 1
+    [ "$JSON_ENGINE" = python3 ] || [ "$JSON_ENGINE" = node ] || return 1
+    case "$JSON_ENGINE" in
+        python3)
+            python3 -c 'import json,sys; last=""
+for ln in open(sys.argv[1],errors="replace"):
+    try: j=json.loads(ln)
+    except Exception: continue
+    ev=j.get("event") or {}
+    if j.get("type")=="context.append_loop_event" and ev.get("type")=="content.part":
+        p=ev.get("part") or {}
+        if p.get("type")=="text" and p.get("text"): last=p["text"]
+sys.stdout.write(last)' "$wire" > "$tmp"
+            ;;
+        node)
+            node -e 'let last="";for(const ln of require("fs").readFileSync(process.argv[1],"utf8").split("\n")){try{const j=JSON.parse(ln);if(j.type==="context.append_loop_event"&&j.event&&j.event.type==="content.part"&&j.event.part&&j.event.part.type==="text"&&j.event.part.text)last=j.event.part.text}catch{}}process.stdout.write(last)' "$wire" > "$tmp"
+            ;;
+    esac || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
+json_write_meta() {
+    local src="$1" dest="$2" mode="$3" pane="$4" title="$5" report="$6" evidence="$7"
+    local tmp="${2}.tmp.$$"; choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node)
+            node -e 'const fs=require("fs");const [src,mode,pane,title,report,evidence]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(src,"utf8"));const o={schema_version:2,status:"delivered",type:j.hook_event_name??"Stop",session_id:j.session_id??"",cwd:j.cwd??"",client:j.client_type??"",mode,pane,title,report,evidence,evidence_present:fs.existsSync(evidence)&&fs.statSync(evidence).size>0,completed_at:new Date().toISOString()};process.stdout.write(JSON.stringify(o,null,2)+"\n")' \
+                "$src" "$mode" "$pane" "$title" "$report" "$evidence" > "$tmp"
+            ;;
+        python3)
+            python3 -c 'import json,sys,os,datetime; src,mode,pane,title,report,evidence=sys.argv[1:]; j=json.load(open(src)); o={"schema_version":2,"status":"delivered","type":j.get("hook_event_name","Stop"),"session_id":j.get("session_id",""),"cwd":j.get("cwd",""),"client":j.get("client_type",""),"mode":mode,"pane":pane,"title":title,"report":report,"evidence":evidence,"evidence_present":os.path.exists(evidence) and os.path.getsize(evidence)>0,"completed_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}; print(json.dumps(o,ensure_ascii=False,indent=2))' \
+                "$src" "$mode" "$pane" "$title" "$report" "$evidence" > "$tmp"
+            ;;
+        jq)
+            jq --arg mode "$mode" --arg pane "$pane" --arg title "$title" --arg report "$report" \
+               --arg evidence "$evidence" --argjson evidence_present "$([ -s "$evidence" ] && echo true || echo false)" \
+               '{schema_version:2,status:"delivered",type:(.hook_event_name//"Stop"),session_id:(.session_id//""),cwd:(.cwd//""),client:(.client_type//""),mode:$mode,pane:$pane,title:$title,report:$report,evidence:$evidence,evidence_present:$evidence_present,completed_at:(now|todateiso8601)}' \
+               "$src" > "$tmp"
+            ;;
+    esac || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
+append_footer() {
+    local report="$1" json="$2" meta="$3" pane="$4" mode="$5" sid cwd
+    grep -q '^\[cx-kimi-tmux\] session-id:' "$report" 2>/dev/null && return 0
+    sid=$(json_scalar "$json" session_id) || sid=""
+    cwd=$(json_scalar "$json" cwd) || cwd=""
+    {
+        printf '\n---\n[cx-kimi-tmux] 完成 %s  mode=%s pane=%s\n' "$(date '+%F %T')" "$mode" "${pane:--}"
+        [ -n "$sid" ] && printf '[cx-kimi-tmux] session-id: %s\n' "$sid"
+        [ -n "$cwd" ] && printf '[cx-kimi-tmux] cwd: %s\n' "$cwd"
+        [ -n "$sid" ] && printf '[cx-kimi-tmux] 续聊: cx-kimi-tmux --resume %s -t <任务名> -o <终报> --brief <追问文件>\n' "$sid"
+        printf '[cx-kimi-tmux] meta: %s\n' "$meta"
+    } >> "$report"
+}
+
+# fallback: $report 为空时,用 last.md(或 num=1 时视为允许) 填补
+finalize_payload() {
+    local report="$1" json="$2" mode="$3" pane="$4" title="$5" fallback="$6"
+    local last="$report.last.md" meta="$report.meta.json" evidence sid cwd tmp
+    evidence=$(derive_evidence "$report")
+
+    if [ ! -s "$report" ]; then
+        [ "$fallback" = 1 ] || return 3
+        tmp="${report}.tmp.$$"
+        [ -s "$last" ] || return 3
+        cp -- "$last" "$tmp" || return 1
+        mv -f -- "$tmp" "$report"
+    fi
+
+    json_write_meta "$json" "$meta" "$mode" "$pane" "$title" "$report" "$evidence" || return 1
+    append_footer "$report" "$json" "$meta" "$pane" "$mode" || return 1
+    sid=$(json_scalar "$json" session_id) || sid=""
+    cwd=$(json_scalar "$json" cwd) || cwd=""
+    session_update "$sid" "$cwd" "$report" "$mode" || return 1
+    if [ -s "$evidence" ]; then write_state "$report" delivered "sid=$sid"
+    else write_state "$report" delivered "sid=$sid evidence-missing=$evidence"; fi
+    return 0
+}
+
+# ---------- Stop hook 入口(由 ~/.kimi-code/config.toml 的 [[hooks]] 调用) ----------
+# 载荷从 stdin 读;归属判定:优先 env CX_KIMI_TMUX_REPORT(2026-08-22 实测 hook 继承 kimi 进程环境),
+# 兜底 $WATCH_DIR/<session_id>(wrapper 发现会话后写入)。
+hook_entry() {
+    local payload="$1" event sid cwd report title mode pane close_pane require_report
+
+    # Only this dispatcher's process marker may route a hook. Session lookup is
+    # for resume, never an authorization to intercept an interactive session.
+    [ -n "${CX_KIMI_TMUX_REPORT:-}" ] || return 0
+
+    event=$(json_scalar <(printf '%s' "$payload") hook_event_name) || event=""
+    sid=$(json_scalar <(printf '%s' "$payload") session_id) || sid=""
+    cwd=$(json_scalar <(printf '%s' "$payload") cwd) || cwd=""
+
+    report="${CX_KIMI_TMUX_REPORT:-}"
+    # 非派发会话:立即退出,零打扰
+    [ -n "$report" ] || return 0
+    [ -s "$report.state" ] || return 0        # 不是我们登记的 report,防误伤
+    [ -d "$report.claim" ] && return 0        # 已交付后的 follow-up 事件一律忽略
+
+    # 回合失败 / 用户中断:立即改变终态,不交报告(wrapper 盯 state 会相应退出/等待)
+    if [ "$event" = "StopFailure" ]; then
+        local etype
+        etype=$(json_scalar <(printf '%s' "$payload") error) || etype=""
+        [ -n "$etype" ] || etype=$(json_scalar <(printf '%s' "$payload") error_type) || etype=""
+        write_state "$report" failed "stop-failure:${etype:-unknown} sid=$sid"
+        printf '%s\n' "$payload" >> "$report.entry.log" 2>/dev/null || true
+        return 0
+    fi
+    if [ "$event" = "Interrupt" ]; then
+        write_state "$report" needs-input "user-interrupt; sid=$sid; 等下一回合"
+        return 0
+    fi
+    [ "$event" = Stop ] || return 0
+    # Prompt mode finalizes after process exit, so a later nonzero exit cannot
+    # race a Stop hook and produce a false successful delivery.
+    [ "${CX_KIMI_TMUX_MODE_KEPT:-pane}" != exec ] || return 0
+
+    title="${CX_KIMI_TMUX_TITLE:-$(basename "$report")}"
+    mode="${CX_KIMI_TMUX_MODE_KEPT:-pane}"
+    close_pane="${CX_KIMI_TMUX_CLOSE_DONE_KEPT:-0}"
+    require_report="${CX_KIMI_TMUX_REQUIRE_REPORT:-1}"
+    mkdir -p -- "$(dirname -- "$report")" || return 2
+    umask 077
+
+    local latest="$report.latest.stop.json" claim="$report.claim" err="$report.notify.error"
+    if ! printf '%s' "$payload" | atomic_write "$latest"; then
+        write_state "$report" failed "hook-write"; return 2
+    fi
+
+    if [ "$require_report" = 1 ] && [ ! -s "$report" ]; then
+        write_state "$report" needs-input "report-missing; sid=$sid; 等下一回合"
+        return 0
+    fi
+    if ! mkdir "$claim" 2>/dev/null; then return 0; fi
+
+    # finalize 前的 last-message 兜底提取(TUI 走 wire.jsonl)
+    if [ ! -s "$report" ] && [ -n "$sid" ] && [ -n "$cwd" ]; then
+        local wire="$KM_HOME/sessions/$(wd_key "$cwd")/$sid/agents/main/wire.jsonl"
+        [ -s "$wire" ] && wire_extract_last "$wire" "$report.last.md" || true
+    fi
+
+    pane=$(pane_for_report "$report")
+    if ! finalize_payload "$report" "$latest" "$mode" "$pane" "$title" "$((1-require_report))"; then
+        printf 'finalize failed at %s\n' "$(date '+%F %T')" | atomic_write "$err"
+        write_state "$report" failed "finalize"
+        rmdir "$claim" 2>/dev/null || true
+        return 2
+    fi
+    atomic_touch "$report.done" || { write_state "$report" failed "done-write"; return 2; }
+    rmdir "$report.run" 2>/dev/null || true
+    rm -f -- "$WATCH_DIR/$sid" 2>/dev/null || true
+
+    if [ -n "$pane" ] && command -v tmux >/dev/null 2>&1; then
+        tmux capture-pane -p -S - -t "$pane" > "$report.pane.log" 2>/dev/null || true
+        chmod 600 "$report.pane.log" 2>/dev/null || true
+        local km_label km_color
+        km_label="cxkm:${title//\#/##}"
+        km_color=$(color_for_report "$report"); [ -n "$km_color" ] || km_color=green
+        tmux select-pane -t "$pane" -T "$km_label ✅" 2>/dev/null || true
+        tmux set-option -p -t "$pane" @cxkm_label "#[fg=$km_color,bold] $km_label ✅ #[default]" 2>/dev/null || true
+        tmux set-option -p -t "$pane" remain-on-exit off 2>/dev/null || true
+        if [ "$close_pane" = 1 ]; then
+            (sleep 0.2; tmux kill-pane -t "$pane" 2>/dev/null || true) &
+        fi
+    fi
+    return 0
+}
+
+# ---------- resume 元数据反查 ----------
+# session_index.jsonl: {"sessionId","sessionDir","workDir"} 每行一条
+index_cwd_for() {
+    local id="$1" idx="$KM_HOME/session_index.jsonl"
+    [ -s "$idx" ] || return 1
+    if choose_json_engine && [ "$JSON_ENGINE" = python3 ]; then
+        python3 -c 'import json,sys; want=sys.argv[1]; hit=""
+for ln in open(sys.argv[2],errors="replace"):
+    try: j=json.loads(ln)
+    except Exception: continue
+    if j.get("sessionId")==want: hit=j.get("workDir") or hit
+sys.stdout.write(hit)' "$id" "$idx"
+    else
+        grep -F "\"$id\"" "$idx" 2>/dev/null | tail -1 | grep -o '"workDir":"[^"]*"' | sed 's/^"workDir":"//;s/"$//'
+    fi
+}
+
+index_last_sid() {
+    local idx="$KM_HOME/session_index.jsonl"
+    [ -s "$idx" ] || return 1
+    tail -1 "$idx" | grep -o '"sessionId":"[^"]*"' | sed 's/^"sessionId":"//;s/"$//'
+}
+
+resolve_resume() { # mutates resume_id/workdir/workdir_set
+    local row="" sid="" cwd="" rep="" epoch="" smode=""
+    if [ "$resume_id" = last ]; then row=$(session_last) || true; else row=$(session_lookup "$resume_id") || true; fi
+    if [ -n "$row" ]; then
+        IFS=$'\t' read -r sid cwd rep epoch smode <<< "$row"
+        resume_id="$sid"
+        if [ "$workdir_set" = 0 ] && [ -n "$cwd" ] && [ -d "$cwd" ]; then workdir="$cwd"; workdir_set=1; fi
+        return 0
+    fi
+
+    [ "$resume_id" = last ] && { resume_id=$(index_last_sid) || resume_id=""; }
+    [ -n "$resume_id" ] || return 1
+    cwd=$(index_cwd_for "$resume_id") || cwd=""
+    if [ "$workdir_set" = 0 ] && [ -n "$cwd" ] && [ -d "$cwd" ]; then workdir="$cwd"; workdir_set=1; fi
+    [ -n "$cwd" ]
+}
+
+# ---------- pane registry 命令 ----------
+state_label() {
+    case "$1" in
+        starting) echo 启动中 ;; running) echo 运行中 ;; needs-input) echo 待输入 ;;
+        detached) echo 后台运行 ;; delivered) echo 已交付 ;; failed) echo 失败 ;;
+        killed) echo 已关闭 ;; *) echo "$1" ;;
+    esac
+}
+
+cmd_list() {
+    local rows pid t rep wd ts color st loc sid
+    rows=$(reg_snapshot) || return 1
+    [ -n "$rows" ] || { echo "(无登记的 kimi pane)"; return 0; }
+    {
+        printf 'PANE\t任务\t状态\t位置\t启动\tSESSION\t终报\n'
+        while IFS=$'\t' read -r pid t rep wd ts color; do
+            [ -n "$pid" ] || continue
+            st=$(read_state "$rep")
+            [ -n "$st" ] || { [ -e "$rep.done" ] && st=delivered || st=running; }
+            if [ "$(tmux display-message -p -t "$pid" '#{pane_dead}' 2>/dev/null)" = 1 ] && [ "$st" != delivered ]; then st=failed; fi
+            loc=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null) || loc='?'
+            sid=""; [ -s "$rep.meta.json" ] && sid=$(json_scalar "$rep.meta.json" session_id 2>/dev/null) || true
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$t" "$(state_label "$st")" "$loc" "$ts" "${sid:0:18}" "$rep"
+        done <<< "$rows"
+    } | { column -t -s "$(printf '\t')" 2>/dev/null || cat; }
+}
+
+cmd_kill() {
+    local sel="${1:-}" rows pid t rep wd ts color win n=0 h st
+    local -a hits=() wins=()
+    [ -n "$sel" ] || { echo "用法: cx-kimi-tmux kill <任务名|%pane_id|done|all>" >&2; return 2; }
+    sel="${sel#cxkm:}"
+    rows=$(reg_snapshot) || return 1
+    [ -n "$rows" ] || { echo "(无登记的 kimi pane)"; return 1; }
+    while IFS=$'\t' read -r pid t rep wd ts color; do
+        st=$(read_state "$rep"); [ -n "$st" ] || { [ -e "$rep.done" ] && st=delivered || st=running; }
+        case "$sel" in
+            all) hits+=("$pid"$'\t'"$t"$'\t'"$rep") ;;
+            done) [ "$st" = delivered ] && hits+=("$pid"$'\t'"$t"$'\t'"$rep") ;;
+            *) if [ "$sel" = "$pid" ] || [ "$sel" = "$t" ]; then hits+=("$pid"$'\t'"$t"$'\t'"$rep"); fi ;;
+        esac
+    done <<< "$rows"
+    ((${#hits[@]})) || { echo "cx-kimi-tmux: 没有匹配 '$sel' 的 pane" >&2; return 1; }
+    if [ "$sel" != all ] && [ "$sel" != done ] && [ ${#hits[@]} -gt 1 ]; then
+        echo "cx-kimi-tmux: '$sel' 命中多个,请改用 %pane_id" >&2; return 3
+    fi
+    for h in "${hits[@]}"; do
+        IFS=$'\t' read -r pid t rep <<< "$h"
+        win=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}' 2>/dev/null) || win=""
+        [ -n "$win" ] && wins+=("$win")
+        if tmux kill-pane -t "$pid" 2>/dev/null; then
+            st=$(read_state "$rep"); [ "$st" = delivered ] || write_state "$rep" killed "pane=$pid"
+            rmdir "$rep.run" 2>/dev/null || true
+            echo "已关闭 $pid $t"; n=$((n+1))
+        fi
+    done
+    reg_prune
+    for win in "${wins[@]}"; do rebalance "$win"; done
+    [ "$n" -gt 0 ]
+}
+
+registered_panes_in_window() {
+    local win="$1" rows pid t rep wd ts color pwin
+    rows=$(reg_snapshot) || return 1
+    while IFS=$'\t' read -r pid t rep wd ts color; do
+        [ -n "$pid" ] || continue
+        pwin=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}' 2>/dev/null) || continue
+        [ "$pwin" = "$win" ] && printf '%s\n' "$pid"
+    done <<< "$rows"
+}
+
+rebalance() {
+    local win="$1" p main="" n
+    local -a all=() cx=()
+    [ "${CX_KIMI_TMUX_LAYOUT:-main-vertical}" = none ] && return 0
+    mapfile -t all < <(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null)
+    mapfile -t cx < <(registered_panes_in_window "$win")
+    n=${#all[@]}
+    [ "$n" -gt 2 ] || return 0
+    [ "$n" -eq $(( ${#cx[@]} + 1 )) ] || return 0 # 有 Codex/其他 pane 时不重排整个 window
+    for p in "${all[@]}"; do
+        if ! printf '%s\n' "${cx[@]}" | grep -qxF "$p"; then main="$p"; break; fi
+    done
+    [ -n "$main" ] || return 0
+    tmux select-layout -t "$win" main-vertical 2>/dev/null || true
+    tmux resize-pane -t "$main" -x "${CX_KIMI_TMUX_MAIN_WIDTH:-60%}" 2>/dev/null || true
+}
+
+# ---------- doctor:装机自检 / 派发失败后的定位入口 ----------
+# 重点回答一个问题:被派发出去的 kimi 能不能连上你配置的 provider。
+# pane 里的 kimi 直连 config.toml 里配好的 base_url —— 代理变量已被 launch.sh 无条件清空,
+# 所以这里做的就是直连实测那个端点。失败样态对照见 docs/TROUBLESHOOTING.md
+DOC_WARN=0 DOC_FAIL=0
+if [ -t 1 ]; then DOC_G=$'\033[32m' DOC_Y=$'\033[33m' DOC_R=$'\033[31m' DOC_0=$'\033[0m'
+else DOC_G="" DOC_Y="" DOC_R="" DOC_0=""; fi
+doc_ok()   { printf '  %s✓%s %s\n' "$DOC_G" "$DOC_0" "$*"; }
+doc_warn() { printf '  %s!%s %s\n' "$DOC_Y" "$DOC_0" "$*"; DOC_WARN=$((DOC_WARN+1)); }
+doc_fail() { printf '  %s✗%s %s\n' "$DOC_R" "$DOC_0" "$*"; DOC_FAIL=$((DOC_FAIL+1)); }
+doc_info() { printf '      %s\n' "$*"; }
+
+# json: model -> provider/type/baseUrl(用 kimi 自己的输出,不手搓 TOML 解析)
+doctor_provider_of() { # $1=json 文件 $2=model  -> provider<TAB>type<TAB>baseUrl
+    choose_json_engine || return 1
+    case "$JSON_ENGINE" in
+        node) node -e 'const fs=require("fs");const [f,m]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(f,"utf8"));const p=(j.models&&j.models[m]&&j.models[m].provider)||"";const pv=(j.providers&&j.providers[p])||{};process.stdout.write([p,pv.type||"",pv.baseUrl||""].join("\t"))' "$1" "$2" ;;
+        python3) python3 -c 'import json,sys
+j=json.load(open(sys.argv[1])); m=sys.argv[2]
+p=(j.get("models",{}).get(m) or {}).get("provider","")
+pv=j.get("providers",{}).get(p) or {}
+sys.stdout.write("\t".join([p, pv.get("type",""), pv.get("baseUrl","")]))' "$1" "$2" ;;
+        jq) jq -r --arg m "$2" '(.models[$m].provider // "") as $p | [$p, (.providers[$p].type // ""), (.providers[$p].baseUrl // "")] | @tsv' "$1" ;;
+    esac
+}
+
+# 连通性实测:显式直连,与 pane 里的 kimi 走同一条路
+# (--noproxy '*' 钉死这一点,免得 doctor 自己的 shell 里残留的代理变量把结论带偏)。
+doctor_probe() { # $1=baseUrl -> 打印 http_code;3=没有 curl
+    local url="${1%/}/models" code
+    command -v curl >/dev/null 2>&1 || return 3
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 12 --noproxy '*' "$url" 2>/dev/null)
+    printf '%s' "${code:-000}"
+}
+
+cmd_doctor() {
+    local live=0 model="" cfg="$KM_HOME/config.toml" tmp prov ptype burl code n hookcmd hookpath
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --live) live=1; shift ;;
+            -m) [ $# -ge 2 ] || die "-m 缺少值"; model="$2"; shift 2 ;;
+            -h|--help) echo "用法: cx-kimi-tmux doctor [--live] [-m MODEL]"; return 0 ;;
+            *) die "doctor: 未知参数 $1" ;;
+        esac
+    done
+
+    echo "cx-kimi-tmux doctor"
+    echo "[1] 依赖"
+    command -v kimi >/dev/null 2>&1 && doc_ok "kimi $(kimi --version 2>/dev/null | head -1)" || doc_fail "未找到 kimi CLI"
+    if command -v tmux >/dev/null 2>&1; then doc_ok "tmux $(tmux -V 2>/dev/null | awk '{print $2}')"
+    else doc_warn "未找到 tmux —— 派发会降级为 exec 无头模式"; fi
+    command -v awk >/dev/null 2>&1 && doc_ok "awk" || doc_fail "缺 awk(安装器需要)"
+    if choose_json_engine; then doc_ok "JSON 引擎: $JSON_ENGINE"
+    else doc_warn "缺 jq/node/python3 —— 终报提取退化为截屏兜底"; fi
+    command -v curl >/dev/null 2>&1 || doc_warn "缺 curl —— 跳过端点连通性实测"
+
+    echo "[2] Stop hook 注入"
+    if [ ! -f "$cfg" ]; then doc_fail "找不到 $cfg"
+    else
+        # grep -c 无匹配时"打印 0 且退出 1",所以不能用 `|| echo 0` 兜 —— 那会让 n 变成两行 "0\n0",
+        # 落进 case 的 *) 分支,把"一个块都没有"误报成"块数不对"。
+        n=$(grep -c '^# >>> call-in-tmux-kimi-cx >>>$' "$cfg" 2>/dev/null); n=${n:-0}
+        case "$n" in
+            0) doc_fail "config.toml 里没有 hook 块 —— 先跑一次 install.sh" ;;
+            1) doc_ok "hook 块 1 个(正确)" ;;
+            *) doc_fail "hook 块 $n 个(应为 1)—— 重跑 install.sh 收敛" ;;
+        esac
+        if python3 "$(dirname "$SELF")/configure.py" check --hooks-only >/dev/null 2>&1; then
+            doc_ok "本插件的三个 hook 均有效且脚本可读"
+        else doc_fail "本插件 hook 不完整或路径已失效;重跑 install.sh"; fi
+    fi
+
+    echo "[3] Provider"
+    tmp="${TMPDIR:-/tmp}/cx-kimi-tmux-doctor.$$.json"
+    if ! kimi provider list --json > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+        rm -f -- "$tmp"; doc_fail "kimi provider list 取不到 provider 配置"
+    else
+        [ -n "$model" ] || model=$(kimi provider list 2>/dev/null | sed -n 's/^Default model:[[:space:]]*//p' | head -1)
+        if [ -z "$model" ]; then doc_fail "解析不出 default model(config.toml 里的 default_model)"
+        else
+            IFS=$'\t' read -r prov ptype burl < <(doctor_provider_of "$tmp" "$model") || true
+            doc_ok "model=$model provider=${prov:-?} type=${ptype:-?}"
+            [ -n "$burl" ] && doc_info "base_url=$burl"
+            case "$ptype" in
+                kimi)
+                    doc_ok "官方托管 provider(oauth)"
+                    if [ -s "$KM_HOME/credentials/kimi-code.json" ]; then doc_ok "oauth 凭据存在"
+                    else doc_warn "找不到 $KM_HOME/credentials/kimi-code.json —— 先 kimi login"; fi
+                    ;;
+                "")  doc_warn "认不出 provider 类型,跳过端点检查" ;;
+                *)
+                    # 自建 / 第三方 OpenAI 兼容端点:直连实测 base_url
+                    doc_info "自建/第三方 provider(type=$ptype)—— 直连实测 base_url"
+                    if [ -n "${CX_KIMI_TMUX_ENV_FILE:-}" ]; then
+                        [ -r "$CX_KIMI_TMUX_ENV_FILE" ] \
+                            && doc_ok "CX_KIMI_TMUX_ENV_FILE=$CX_KIMI_TMUX_ENV_FILE(会在 pane 内最后 source)" \
+                            || doc_fail "CX_KIMI_TMUX_ENV_FILE 不可读: $CX_KIMI_TMUX_ENV_FILE"
+                    fi
+                    if [ -n "$burl" ]; then
+                        code=$(doctor_probe "$burl"); n=$?
+                        # 判据:2xx/4xx = 端点本人应答了(401/404 也算通);000 = 连不上;
+                        # 5xx = 端点应答了但它自己不健康,不能算可达。
+                        case "$n$code" in
+                            3*) doc_warn "没有 curl,跳过端点连通性实测(可用 doctor --live 端到端确认)" ;;
+                            *000)
+                                doc_fail "端点连不上(curl 无应答):$burl"
+                                doc_info "派发出去的任务会以 stop-failure:APIConnectionError 失败" ;;
+                            *50[0-9])
+                                doc_fail "端点应答了 HTTP $code,但它自己不健康:$burl"
+                                doc_info "派发出去的任务会以 stop-failure:APIConnectionError 失败" ;;
+                            *) doc_ok "端点实测可达(HTTP $code)" ;;
+                        esac
+                        case "$n$code" in
+                            3*) : ;;
+                            *000|*50[0-9])
+                                doc_info "先确认 config.toml 里这个 base_url 写对了、服务确实在跑"
+                                doc_info "     判据与失败样态见 docs/TROUBLESHOOTING.md" ;;
+                        esac
+                    fi
+                    ;;
+            esac
+        fi
+        rm -f -- "$tmp"
+    fi
+
+    if [ "$live" = 1 ]; then
+        echo "[4] 端到端实跑(--live)"
+        local out
+        out=$(
+            set +u
+            if [ -n "${CX_KIMI_TMUX_ENV_FILE:-}" ] && [ -r "$CX_KIMI_TMUX_ENV_FILE" ]; then . "$CX_KIMI_TMUX_ENV_FILE" || true; fi
+            export KIMI_CODE_NO_AUTO_UPDATE=1
+            cd "${TMPDIR:-/tmp}" || exit 1
+            # 端点不通时 kimi 会退避重试十次(>2min),这里给个明确上界:
+            # 一个回合在界内跑不完,对派发场景来说就等于失败。
+            # 用 stream-json:失败时事件流里带 error_name(APIConnectionError 等),
+            # 纯文本模式什么线索都留不下。
+            timeout "${CX_KIMI_TMUX_DOCTOR_LIVE_TIMEOUT:-90}" \
+                kimi -p "reply with exactly: CX_KIMI_TMUX_DOCTOR_OK" --output-format stream-json 2>&1
+        )
+        case "$out" in
+            *CX_KIMI_TMUX_DOCTOR_OK*) doc_ok "kimi 用 pane 相同的环境成功完成了一次回合" ;;
+            *)
+                local lerr
+                lerr=$(printf '%s\n' "$out" | grep -o '"error_name":"[^"]*"' | tail -1 | sed 's/.*:"//;s/"$//')
+                doc_fail "实跑失败${lerr:+($lerr)} —— 派发出去的任务会同样失败"
+                printf '%s\n' "$out" | grep -v '"type":"system.version"' | tail -2 | cut -c1-160 | sed 's/^/        /'
+                ;;
+        esac
+    fi
+
+    printf '\n结果: %d 项失败, %d 项警告\n' "$DOC_FAIL" "$DOC_WARN"
+    [ "$DOC_FAIL" = 0 ] || { echo "详见 docs/TROUBLESHOOTING.md"; return 2; }
+    [ "$DOC_WARN" = 0 ] || return 1
+    return 0
+}
+
+case "${1:-}" in
+    __stop_hook)
+        # hook 语义:读干 stdin,fail-open;任何异常都不能影响主会话
+        payload=$(cat 2>/dev/null) || payload=""
+        [ -n "$payload" ] || exit 0
+        hook_entry "$payload" || true
+        exit 0
+        ;;
+    list|ls) shift; cmd_list "$@"; exit $? ;;
+    doctor|check) shift; cmd_doctor "$@"; exit $? ;;
+    kill|close|rm) shift; cmd_kill "$@"; exit $? ;;
+esac
+
+# ---------- dispatch 参数解析 ----------
+title="" report="" workdir="$PWD" workdir_set=0 brief_src="" resume_id=""
+target_override="${CX_KIMI_TMUX_TARGET:-}"
+mode="${CX_KIMI_TMUX_MODE:-pane}" close_pane="${CX_KIMI_TMUX_CLOSE_DONE:-0}" timeout="${CX_KIMI_TMUX_TIMEOUT:-0}"
+require_report="${CX_KIMI_TMUX_REQUIRE_REPORT:-1}"
+approval="${CX_KIMI_TMUX_APPROVAL:-auto}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t) [ $# -ge 2 ] || die "-t 缺少值"; title="$2"; shift 2 ;;
+        -o) [ $# -ge 2 ] || die "-o 缺少值"; report="$2"; shift 2 ;;
+        -C) [ $# -ge 2 ] || die "-C 缺少值"; workdir="$2"; workdir_set=1; shift 2 ;;
+        --brief) [ $# -ge 2 ] || die "--brief 缺少值"; brief_src="$2"; shift 2 ;;
+        --resume) [ $# -ge 2 ] || die "--resume 缺少值"; resume_id="$2"; shift 2 ;;
+        --target) [ $# -ge 2 ] || die "--target 缺少值"; target_override="$2"; shift 2 ;;
+        -w|--window) mode=window; shift ;;
+        --close) close_pane=1; shift ;;
+        --timeout) [ $# -ge 2 ] || die "--timeout 缺少值"; timeout="$2"; shift 2 ;;
+        --allow-last-message) require_report=0; shift ;;
+        --) shift; break ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "未知参数 $1(Kimi flags 请放在 -- 之后)" ;;
+    esac
+done
+extra=("$@")
+
+[ -n "$report" ] || die "缺少 -o REPORT"
+case "$mode" in pane|window|exec) ;; *) die "CX_KIMI_TMUX_MODE 必须是 pane、window 或 exec" ;; esac
+case "$approval" in auto|yolo|manual) ;; *) die "CX_KIMI_TMUX_APPROVAL 必须是 auto、yolo 或 manual" ;; esac
+[[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout 必须是非负整数秒"
+case "$require_report" in 0|1) ;; *) die "CX_KIMI_TMUX_REQUIRE_REPORT 必须是 0 或 1" ;; esac
+case "$close_pane" in 0|1) ;; *) die "CX_KIMI_TMUX_CLOSE_DONE 必须是 0 或 1" ;; esac
+tsv_safe "$title" || die "任务标题不能包含 tab/newline"
+tsv_safe "$report" || die "报告路径不能包含 tab/newline"
+tsv_safe "$workdir" || die "工作目录不能包含 tab/newline"
+
+for f in "${extra[@]}"; do
+    case "$f" in
+        -p*|--prompt|--prompt=*|--output-format|--output-format=*|-S*|--session|--session=*|-c|--continue|--continue=*|--auto|--auto=*|-y|--yolo|--yes|--auto-approve|--plan)
+            die "Kimi flag '$f' 由 cx-kimi-tmux 管理,不能重复传入" ;;
+    esac
+done
+if [ -n "$resume_id" ]; then
+    for f in "${extra[@]}"; do
+        case "$f" in
+            --agent|--agent=*|--agent-file|--agent-file=*) die "resume 会话不能换 agent:'$f' 与 --session 冲突" ;;
+        esac
+    done
+fi
+
+command -v kimi >/dev/null 2>&1 || die "未找到 kimi CLI"
+command -v python3 >/dev/null 2>&1 || die "需要 python3 >= 3.9"
+
+# 交互式 shell 的 alias/函数脚本看不见,而 pane/exec 里跑的是 kimi 本体。CX_KIMI_TMUX_ENV_FILE 就是
+# 把这类"只存在于你终端里、只给被派发的 kimi 用的环境"显式交进来的通用逃生口:在所有环境同步
+# 之后最后 source,可覆盖其中任何一项(含被清空的代理变量)。不设则完全不生效。
+env_file="${CX_KIMI_TMUX_ENV_FILE:-}"
+if [ -n "$env_file" ]; then
+    env_file=$(realpath -m -- "$env_file")
+    [ -r "$env_file" ] || die "CX_KIMI_TMUX_ENV_FILE 不可读: $env_file"
+fi
+
+report=$(realpath -m -- "$report")
+mkdir -p -- "$(dirname "$report")" || die "无法创建报告目录"
+[ -n "$title" ] || { title=$(basename "$report"); title="${title%%.*}"; }
+tsv_safe "$title" || die "任务标题不能包含 tab/newline"
+
+# ---------- 定位要 split 的 tmux pane ----------
+# Codex IDE/某些包装器会剥掉 TMUX 环境变量;先用 tty 匹配 pane_tty,不行沿进程树匹配 pane_pid
+find_current_tmux_pane() {
+    [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] && { printf '%s' "$TMUX_PANE"; return 0; }
+    command -v tmux >/dev/null 2>&1 || return 1
+    local tty="" pane="" pid="" ppid=""
+    tty=$(tty 2>/dev/null) || tty=""
+    if [ -n "$tty" ]; then
+        pane=$(tmux list-panes -a -F '#{pane_tty} #{pane_id}' 2>/dev/null \
+            | awk -v t="$tty" '$1==t{print $2; exit}')
+        [ -n "$pane" ] && { printf '%s' "$pane"; return 0; }
+    fi
+    pid=$$
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+        pane=$(tmux list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null \
+            | awk -v p="$pid" '$1==p{print $2; exit}')
+        [ -n "$pane" ] && { printf '%s' "$pane"; return 0; }
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || ppid=""
+        [ -n "$ppid" ] && [ "$ppid" != "$pid" ] || break
+        pid=$ppid
+    done
+    return 1
+}
+
+target=""
+if [ "$mode" != exec ]; then
+    if command -v tmux >/dev/null 2>&1; then
+        if [ -n "$target_override" ]; then
+            target=$(tmux display-message -p -t "$target_override" '#{pane_id}' 2>/dev/null) || die "无效的 tmux target: $target_override"
+            [ -n "$target" ] || die "无效的 tmux target: $target_override"
+        else target=$(find_current_tmux_pane); fi
+        [ -n "$target" ] || mode=exec
+    else
+        [ -z "$target_override" ] || die "--target 需要 tmux"
+        mode=exec
+    fi
+fi
+
+if [ -n "$resume_id" ]; then
+    resolve_resume || { [ "$resume_id" = last ] && die "无法解析 last 会话;请传明确 session-id" || true; }
+fi
+if [ "$mode" = exec ] && [ "$approval" != auto ]; then
+    die "Kimi --prompt 不兼容交互审批模式;请用 tmux pane/window，或设置 CX_KIMI_TMUX_APPROVAL=auto 使用原生无头模式"
+fi
+if [ "$workdir_set" = 1 ]; then
+    [ -d "$workdir" ] || die "工作目录不存在: $workdir"
+    workdir=$(realpath -m -- "$workdir")
+elif [ -z "$resume_id" ]; then
+    workdir=$(realpath -m -- "$workdir")
+fi
+if [ -n "$resume_id" ] && [ "$mode" != exec ] && [ "$workdir_set" = 0 ]; then
+    die "无法恢复 resume 会话 cwd;请显式传 -C"
+fi
+
+if report_in_use "$report"; then die "报告路径正在被另一个 pane 使用: $report"; fi
+[ ! -d "$report.run" ] || die "报告路径已有活动 run lock: $report.run"
+
+evidence=$(derive_evidence "$report")
+if [ -n "$brief_src" ]; then
+    brief_src=$(realpath -m -- "$brief_src")
+    [ -s "$brief_src" ] || die "简报为空或不存在: $brief_src"
+    for reserved in "$report" "$evidence" "$report.done" "$report.stop.json" "$report.latest.stop.json" \
+        "$report.last.md" "$report.meta.json" "$report.state" "$report.notify.error" \
+        "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" "$report.gate" "$report.entry.log"; do
+        [ "$brief_src" != "$(realpath -m -- "$reserved")" ] || die "简报路径与输出文件冲突: $brief_src"
+    done
+fi
+# Acquire the per-report lock before touching artifacts: concurrent dispatches
+# to the same output must never delete each other's input or results.
+mkdir "$report.run" || die "无法建立 run lock: $report.run"
+chmod 700 "$report.run" 2>/dev/null || true
+rmdir "$report.claim" 2>/dev/null || true
+rm -f -- "$report" "$evidence" "$report.done" "$report.stop.json" "$report.latest.stop.json" \
+    "$report.last.md" "$report.meta.json" "$report.state" "$report.notify.error" \
+    "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" \
+    "$report.gate" "$report.entry.log"
+[ "$brief_src" = "$report.brief" ] 2>/dev/null || rm -f -- "$report.brief"
+write_state "$report" starting "mode=$mode"
+atomic_touch "$report.stamp"
+
+brief="$report.brief"
+if [ -n "$brief_src" ]; then
+    if [ "$brief_src" != "$brief" ]; then
+        atomic_copy "$brief_src" "$brief" || { rmdir "$report.run"; die "无法复制简报"; }
+    fi
+else
+    atomic_write "$brief" || { rmdir "$report.run"; die "无法从 stdin 写入简报"; }
+fi
+[ -s "$brief" ] || { rmdir "$report.run"; die "简报为空"; }
+
+panelog="$report.pane.log" events="$report.events.jsonl"
+gate="$report.gate" launch_sh="$report.launch.sh"
+
+# ---------- bootstrap 提示词(注入 TUI 或并入 exec prompt;单行避免换行坑) ----------
+bootstrap_exec="阅读并原样执行简报文件: $brief 。仅当任务真正完成时,把最终摘要(结论/交付物/偏差,≤50行)写入: $report ,详细证据写入: $evidence 。不要只写摘要来反问——需要澄清就在对话里说明并停下等待。"
+bootstrap_tui="$bootstrap_exec[ktm-$(printf '%s' "$report" | sha256sum | cut -c1-6)]"
+
+# ---------- exec 无头模式 ----------
+if [ "$mode" = exec ]; then
+    write_state "$report" running "mode=exec"
+    cmd=(kimi -p)
+    prompt_text="$bootstrap_exec"$'\n\n'"$(cat -- "$brief")"
+    cmd+=("$prompt_text" --output-format stream-json)
+    # Kimi 0.42 rejects --prompt combined with --auto/-y. Prompt mode has
+    # its own noninteractive execution policy; TUI approval flags stay in TUI.
+    [ -n "$resume_id" ] && cmd+=(--session "$resume_id")
+    cmd+=("${extra[@]}")
+    if [ "$timeout" -gt 0 ]; then
+        command -v timeout >/dev/null 2>&1 || { rmdir "$report.run"; die "无头超时需要 GNU timeout"; }
+        cmd=(timeout --kill-after=5 "$timeout" "${cmd[@]}")
+    fi
+    (
+        cd "$workdir" || exit 2
+        export CX_KIMI_TMUX_REPORT="$report" CX_KIMI_TMUX_TITLE="$title" CX_KIMI_TMUX_MODE_KEPT=exec
+        export CX_KIMI_TMUX_CLOSE_DONE_KEPT=0 CX_KIMI_TMUX_REQUIRE_REPORT="$require_report"
+        export KIMI_CODE_NO_AUTO_UPDATE=1
+        unset KIMI_TMUX_REPORT KIMI_TMUX_TITLE KIMI_TMUX_MODE_KEPT
+        unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
+        [ -n "$env_file" ] && { . "$env_file" || exit 2; }
+        exec "${cmd[@]}"
+    ) < /dev/null > "$events" 2> "$panelog"
+    ec=$?
+
+    sid=$(exec_extract_sid "$events") || sid=""
+    exec_extract_last "$events" "$report.last.md" 2>/dev/null || true
+
+    if [ "$ec" -eq 0 ] && [ "$(read_state "$report")" = failed ]; then ec=2; fi
+    if [ "$ec" -ne 0 ]; then
+        write_state "$report" failed "exec=$ec"
+        rmdir "$report.run" 2>/dev/null || true
+        echo "[cx-kimi-tmux] exec 失败 exit=$ec 日志=$panelog 事件=$events" >&2
+        exit "$ec"
+    fi
+
+    # hook 在 exec 中也会触发(env 已实测继承):若已交付则跳过;claim 目录仲裁防双重 finalize
+    if [ ! -e "$report.done" ]; then
+        if mkdir "$report.claim" 2>/dev/null; then
+            canonical="$report.stop.json"
+            python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="Stop",session_id=sys.argv[1],cwd=sys.argv[2],client_type="kimi_code_cli_exec")))' \
+                "$sid" "$workdir" | atomic_write "$canonical"
+            finalize_payload "$report" "$canonical" exec "" "$title" "$((1-require_report))" || {
+                write_state "$report" failed "exec-finalize: report missing or invalid"; rmdir "$report.claim" "$report.run" 2>/dev/null || true
+                die "Kimi 未写报告或报告交付失败;检查 $events;仅需最后回复时可加 --allow-last-message"
+            }
+            atomic_touch "$report.done"
+            rmdir "$report.run" 2>/dev/null || true
+        else
+            # hook 已获得交付权,等它落 done
+            for _km_i in {1..240}; do [ -e "$report.done" ] && break; sleep 0.5; done
+        fi
+    fi
+    [ -e "$report.done" ] || { write_state "$report" failed "finalize-timeout"; rmdir "$report.run" 2>/dev/null || true; die "报告交付超时"; }
+    echo "[cx-kimi-tmux] exec 已交付 report=$report session=$sid"
+    exit 0
+fi
+
+# ---------- 目录信任预置(2026-08-22 实证:手写 marker 即豁免弹窗) ----------
+ensure_trusted_workdir() {
+    [ "$approval" != manual ] || return 0
+    local dir="$KM_HOME/workspace-trust" key tmp lock="$REG_DIR/trust.lock" i=0
+    key=$(wd_key "$workdir")
+    [ -s "$dir/$key" ] && return 0
+    mkdir -p -- "$dir" 2>/dev/null || return 0
+    until mkdir "$lock" 2>/dev/null; do i=$((i+1)); [ "$i" -ge 100 ] && return 0; sleep 0.1; done
+    if [ ! -s "$dir/$key" ]; then
+        tmp="$dir/.$key.tmp.$$"
+        (umask 077; python3 -c 'import json,sys,time; print(json.dumps(dict(root=sys.argv[1],trustedAt=int(time.time()*1000))))' "$workdir" > "$tmp") \
+            && mv -f -- "$tmp" "$dir/$key" \
+            && echo "[cx-kimi-tmux] 已预置目录信任: $workdir -> $dir/$key"
+    fi
+    rmdir "$lock" 2>/dev/null || true
+}
+ensure_trusted_workdir
+
+# ---------- 生成 launch.sh ----------
+kimi_bin=$(command -v kimi 2>/dev/null) || kimi_bin=kimi
+launch_args=(--auto)
+[ "$approval" = yolo ] && launch_args=(-y)
+[ "$approval" = manual ] && launch_args=()
+[ -n "$resume_id" ] && launch_args+=(--session "$resume_id")
+launch_args+=("${extra[@]}")
+
+{
+    printf '#!/usr/bin/env bash\nset -u\n'
+    printf 'cd %q || exit 2\n' "$workdir"
+    printf 'unset KIMI_TMUX_REPORT KIMI_TMUX_TITLE KIMI_TMUX_MODE_KEPT\n'
+    printf 'export CX_KIMI_TMUX_REPORT=%q CX_KIMI_TMUX_TITLE=%q CX_KIMI_TMUX_MODE_KEPT=%q\n' "$report" "$title" "$mode"
+    printf 'export CX_KIMI_TMUX_CLOSE_DONE_KEPT=%q CX_KIMI_TMUX_REQUIRE_REPORT=%q KIMI_CODE_NO_AUTO_UPDATE=1\n' "$close_pane" "$require_report"
+    # kimi 直连 config.toml 里配好的 base_url,不经任何代理。而 tmux pane 继承的是 tmux server
+    # 那份环境(登录时那一刻的,常残留早已失效的代理),所以代理变量在这里无条件清空 ——
+    # 不看派发方有没有设。要走代理只有一条显式路径:CX_KIMI_TMUX_ENV_FILE(最后 source,能覆盖)。
+    for _km_v in HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy; do
+        printf 'unset %s 2>/dev/null || true\n' "$_km_v"
+    done
+    # 反过来,这几个必须与派发方保持一致:
+    #   KIMI_CODE_HOME      —— kimi 本体认这个变量。不同步则 pane 写 ~/.kimi-code、
+    #                          wrapper 却在自定义 home 下找 wire.jsonl/信任标记 → 假 entry-timeout + 信任弹窗
+    #   CX_KIMI_TMUX_CACHE_DIR —— hook 是 pane 的子进程,不同步则它读不到本次的 registry/watch/sessions 登记
+    for _km_v in KIMI_CODE_HOME CX_KIMI_TMUX_CACHE_DIR XDG_CACHE_HOME; do
+        if [ -n "${!_km_v:-}" ]; then printf 'export %s=%q\n' "$_km_v" "${!_km_v}"; else printf 'unset %s 2>/dev/null || true\n' "$_km_v"; fi
+    done
+    # PATH 只覆盖、绝不清空:pane 里找不到 kimi 是最常见的启动失败(server 的 PATH 是登录时的)
+    printf 'export PATH=%q\n' "$PATH"
+    # 最后 source 派发方指定的环境补丁 —— 它可以覆盖上面同步/清空的任何变量
+    [ -n "$env_file" ] && printf '. %q || { echo "cx-kimi-tmux: 加载 CX_KIMI_TMUX_ENV_FILE 失败: %s" >&2; exit 2; }\n' "$env_file" "$env_file"
+    printf 'for _km_i in {1..200}; do [ -e %q ] && break; sleep 0.05; done\n' "$gate"
+    # 用派发时解析到的绝对路径 exec,彻底绕开 pane 的 PATH
+    printf 'exec %q' "$kimi_bin"
+    printf ' %q' "${launch_args[@]}"
+    printf '\n'
+} > "$launch_sh"
+chmod 700 "$launch_sh"
+
+# ---------- split pane / 开 window ----------
+pane_id="" win="" nw_target="" color="" started=$(date '+%F %T')
+printf -v panecmd 'exec bash %q' "$launch_sh"
+if [ "$mode" = pane ]; then
+    if [ -n "$target" ]; then win=$(tmux display-message -p -t "$target" '#{session_name}:#{window_index}' 2>/dev/null) || win=""
+    else win=$(tmux display-message -p '#{session_name}:#{window_index}' 2>/dev/null) || win=""; fi
+    mapfile -t cxp < <(registered_panes_in_window "$win")
+    if [ ${#cxp[@]} -eq 0 ]; then
+        split_target="$target"
+        [ -n "$split_target" ] || split_target="$win"
+        pane_id=$(tmux split-window -d -t "$split_target" -h -l "${CX_KIMI_TMUX_PANE_WIDTH:-40%}" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    else
+        c=${#cxp[@]}; p="${cxp[$(( (c - 1) / 2 ))]}"; dir=-h; [ $((c % 2)) = 1 ] && dir=-v
+        pane_id=$(tmux split-window -d -t "$p" "$dir" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    fi
+fi
+if [ -z "$pane_id" ]; then
+    # new-window 的 -t 只收 window/session 目标 —— 直接把 pane id 传进去会被 tmux 拒绝
+    # ("can't specify pane here"),这会同时废掉 -w 模式和"窗格没空间就转独立 window"的兜底。
+    # 且 -t <session:index> 意为"建在该索引",索引被占时报 "index N in use",故用 -a(接在其后)。
+    nw_target=""
+    [ -n "$target" ] && { nw_target=$(tmux display-message -p -t "$target" '#{session_name}:#{window_index}' 2>/dev/null) || nw_target=""; }
+    [ -n "$nw_target" ] || nw_target="$win"
+    if [ -n "$nw_target" ]; then
+        pane_id=$(tmux new-window -d -a -t "$nw_target" -n "cxkm:$title" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    fi
+    [ -n "$pane_id" ] || pane_id=$(tmux new-window -d -n "cxkm:$title" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    mode=window
+fi
+if [ -z "$pane_id" ]; then
+    write_state "$report" failed "tmux-launch"
+    rmdir "$report.run" 2>/dev/null || true
+    die "无法创建 tmux pane/window"
+fi
+
+rows=$(reg_snapshot) || rows=""; ncx=0; [ -n "$rows" ] && ncx=$(printf '%s\n' "$rows" | grep -c .)
+color=${KM_COLORS[$(( ncx % ${#KM_COLORS[@]} ))]}
+# 标题钉死不能依赖 pane_title:Kimi TUI 跑起来后会用 OSC 把 pane_title 改成当前提示词内容
+# (实测),而原来那行 allow-set-title 根本不是 tmux 选项(实测 "invalid option",被 2>/dev/null
+# 吞掉了),所以标题从来就没钉住过。
+# 也不能把标签直接写进 pane-border-format:它是 *window* 级选项(-p 会静默落到 window 上),
+# 同窗口并发多个任务时所有窗格会串成同一个标签。
+# 正解:标签存进 *pane* 级用户选项 @cxkm_label,window 级格式只写 #{@cxkm_label} —— 逐窗格解析。
+km_label="cxkm:${title//\#/##}"      # # 在 tmux 格式串里有含义,要转义
+tmux select-pane -t "$pane_id" -T "$km_label" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" pane-border-style "fg=$color" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" pane-active-border-style "fg=$color" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" @cxkm_label "#[fg=$color,bold] $km_label #[default]" 2>/dev/null || true
+tmux set-option -w -t "$pane_id" pane-border-format '#{?@cxkm_label,#{@cxkm_label},#{pane_title}}' 2>/dev/null || true
+tmux set-option -w -t "$pane_id" allow-rename off 2>/dev/null || true
+tmux set-option -p -t "$pane_id" remain-on-exit on 2>/dev/null || true
+tmux set-option -w -t "$pane_id" pane-border-status top 2>/dev/null || true
+# resume 场景 session id 已知,立即登记 watch(hook 的无 env 兜底)
+if [ -n "$resume_id" ]; then
+    mkdir -p -- "$WATCH_DIR" && printf '%s' "$report" > "$WATCH_DIR/$resume_id" 2>/dev/null || true
+fi
+reg_add "$pane_id" "$title" "$report" "$workdir" "$started" "$color" || true
+[ "$mode" = pane ] && [ -n "$win" ] && rebalance "$win"
+write_state "$report" running "pane=$pane_id mode=$mode"
+atomic_touch "$gate"
+echo "[cx-kimi-tmux] pane=$pane_id title=cxkm:$title color=$color 启动:$launch_sh"
+
+capture() {
+    (umask 077; tmux capture-pane -p -S - -t "$pane_id" > "$panelog" 2>/dev/null) || true
+}
+
+detached_by_signal=0
+on_detach_signal() {
+    detached_by_signal=1
+    write_state "$report" detached "signal; pane=$pane_id"
+    echo "cx-kimi-tmux: wrapper 收到信号,Kimi 继续在 pane=$pane_id 运行;hook 仍会独立交付" >&2
+    exit 130
+}
+trap on_detach_signal INT TERM HUP
+
+# ---------- TUI 就绪 + 注入首提示词 ----------
+# chrome(0.38.0 实测):就绪=出现输入框行 "│ >" 或 "No session yet — one will be created" 或底栏 "context:";
+# 信任弹窗="Trust this folder?"(默认选中 "Don't trust"=退出;选 Trust 用 Up+Enter,向上即回顶)。
+dismiss_trust_if_present() {
+    [ "$approval" != manual ] || return 1
+    local scr="$1"
+    if printf '%s' "$scr" | grep -q 'Trust this folder'; then
+        printf '=== %s 信任弹窗自动确认 ===\n' "$(date '+%F %T')" >> "$report.entry.log" 2>/dev/null || true
+        tmux send-keys -t "$pane_id" Up 2>/dev/null || true
+        sleep 0.3
+        tmux send-keys -t "$pane_id" Enter 2>/dev/null || true
+        echo "[cx-kimi-tmux] 检测到信任弹窗,已选择 Trust pane=$pane_id"
+        return 0
+    fi
+    return 1
+}
+
+pane_ready() {
+    local scr
+    scr=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null) || return 1
+    dismiss_trust_if_present "$scr" && return 1      # 处理了弹窗就再等一轮
+    printf '%s' "$scr" | grep -qE '│ >|No session yet|context:' ||
+    printf '%s' "$scr" | grep -qF '❯'
+}
+
+inject_trace() { printf '%s %s %s\n' "$(date '+%T')" "$1" "$2" >> "$report.entry.log" 2>/dev/null || true; }
+
+# 唯一尾标(短 ASCII token,放 bootstrap 末尾;盒内折行也基本不会拆断)
+inj_mark() { printf 'ktm-%s' "$(printf '%s' "$report" | sha256sum | cut -c1-6)"; }
+
+# 只认输入盒区域(带 │ 边框的行);提交后文本进 transcript(✨ 前缀、无 │ 边框),据此区分"在盒内/已提交"
+#
+# 盒内文本按盒宽折行,ASCII 尾标可能正好被劈到两行 —— 是否被劈只取决于报告路径长度,
+# 即同一条 -o 路径要么恒好要么恒坏(实测:劈开时会反复重投,模型最终收到多份 bootstrap)。
+# 折行处还会插入边框/续行提示符(`│`、`>`、缩进),所以只剥边框仍会匹配失败。
+# 对策:盒内文本压成"只剩字母数字"的一行再比对,needle 同样处理 —— 与一切装饰无关。
+# needle 只用 ASCII(尾标、路径),被压缩后仍足够独特,误判概率可忽略。
+alnum_of() { printf '%s' "$1" | tr -cd '[:alnum:]'; }
+
+box_alnum() {
+    tmux capture-pane -p -t "$pane_id" 2>/dev/null | grep -F '│' | tr -cd '[:alnum:]'
+}
+
+box_has() {
+    local needle flat
+    needle=$(alnum_of "$1"); [ -n "$needle" ] || return 1
+    flat=$(box_alnum) || return 1
+    case "$flat" in *"$needle"*) return 0 ;; *) return 1 ;; esac
+}
+
+box_has_mark() { box_has "$1"; }
+
+# 用于区分"整段没落地"与"落地了但还在渲染 / 只落了半截":简报路径出现在 bootstrap 最开头,
+# 是纯 ASCII 且足够独特。只有确证盒内连它都没有(=一个字都没落地)才允许改用 send-keys 重发,
+# 否则重发会让模型收到重复提示词。
+inj_head() { printf '%s' "$brief"; }
+
+# 返回 0=已投递并成功提交;1=尚未落地(可重试);2=只落了半截(重投会重复,交由调用方大声失败)
+inject_prompt() {
+    local text="$1" mark head i j
+    mark=$(inj_mark); head=$(inj_head)
+    # A. 投递:尾标不在盒内才发 paste(幂等,绝不重复投递)
+    if ! box_has_mark "$mark"; then
+        if box_has "$head"; then
+            # 盒内已有本次投递的开头:paste 已落地,只是还在渲染 —— 等,绝不重投
+            inject_trace "partial-present-wait" "$mark"
+            for i in {1..60}; do sleep 0.25; box_has_mark "$mark" && break; done
+            box_has_mark "$mark" || { inject_trace "partial-stuck" "$mark"; return 2; }
+        else
+            tmux set-buffer -b "kt-inj-$$" -- "$text" 2>/dev/null || true
+            tmux paste-buffer -d -b "kt-inj-$$" -t "$pane_id" 2>/dev/null || true
+            inject_trace "paste" "$mark"
+            for i in {1..60}; do sleep 0.25; box_has_mark "$mark" && break; done
+            if ! box_has_mark "$mark"; then
+                # 有开头没尾标 = 半截,重发整段会让模型收到重复提示词:不重发
+                box_has "$head" && { inject_trace "paste-partial" "$mark"; return 2; }
+                inject_trace "paste-lost->send-keys-l" "$mark"
+                tmux send-keys -t "$pane_id" -l -- "$text" 2>/dev/null || true
+                for i in {1..60}; do sleep 0.25; box_has_mark "$mark" && break; done
+            fi
+        fi
+    else
+        inject_trace "already-present" "$mark"
+    fi
+    box_has_mark "$mark" || { inject_trace "deliver-fail" "$mark"; return 1; }
+    sleep 0.5   # 等 bracketed-paste 收尾;Enter 与 paste 同链连发会被吞(上游实证坑)
+    # B. 提交:Enter 单独发,直到尾标离开输入盒才算真提交;其间绝不重投文本
+    for i in 1 2 3 4; do
+        tmux send-keys -t "$pane_id" Enter 2>/dev/null || true
+        for j in {1..12}; do sleep 0.25; box_has_mark "$mark" || break; done
+        box_has_mark "$mark" || { inject_trace "submitted" "attempt=$i"; return 0; }
+        inject_trace "enter-swallowed" "attempt=$i"
+    done
+    return 1
+}
+
+entry_timeout=${CX_KIMI_TMUX_ENTRY_TIMEOUT:-120}
+entry_deadline=$((SECONDS + entry_timeout))
+ready=0 injected=0 entered=0 dismissed=0
+stamp_file="$report.stamp"
+discovered_sid=""
+
+entry_wire_check() { # return 0=任务确认进入执行(该 workdir 有新 wire.jsonl 且有内容)
+    local bucket="$KM_HOME/sessions/$(wd_key "$workdir")" f
+    [ -d "$bucket" ] || return 1
+    f=$(find "$bucket" -type f -name wire.jsonl -path '*/agents/main/*' -newer "$stamp_file" 2>/dev/null | head -1)
+    [ -n "$f" ] && [ -s "$f" ] || return 1
+    # 顺便捞 session-id 供 watch 兜底与报告
+    if [ -z "$discovered_sid" ]; then
+        discovered_sid=$(printf '%s' "$f" | sed -n "s|.*/sessions/[^/]*/\([^/]*\)/agents/main/wire.jsonl|\1|p")
+        if [ -n "$discovered_sid" ]; then
+            mkdir -p -- "$WATCH_DIR" && printf '%s' "$report" > "$WATCH_DIR/$discovered_sid" 2>/dev/null || true
+            echo "[cx-kimi-tmux] 已识别 session=$discovered_sid pane=$pane_id"
+        fi
+    fi
+    return 0
+}
+
+entry_fail() { # $1=state detail  $2=人读的原因
+    capture
+    write_state "$report" failed "$1"
+    rmdir "$report.run" 2>/dev/null || true
+    echo "cx-kimi-tmux: $2;现场见 $panelog 与 $report.entry.log" >&2
+    exit 2
+}
+
+inj_rc=0 dead=""
+while :; do
+    if [ "$entered" = 0 ]; then
+        # 已交付就不再纠缠启动期检测:wire.jsonl 是启发式,它认不出来不该把成功的交付判成失败
+        if [ -e "$report.done" ]; then
+            entered=1
+            echo "[cx-kimi-tmux] 启动期内已交付 pane=$pane_id"
+        else
+            # 窗格死亡立刻定性(kimi 不在 pane 的 PATH 里 / 配置错 / 秒崩),不空等满 entry timeout
+            dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
+            if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
+                sleep 1
+                if [ -e "$report.done" ]; then entered=1
+                else entry_fail "pane-dead-at-entry=$pane_id" "Kimi 窗格在启动期就死了且未交付(先看 pane.log 首行)"; fi
+            fi
+        fi
+    fi
+    if [ "$entered" = 0 ]; then
+        if [ "$ready" = 0 ]; then
+            if pane_ready; then
+                ready=1
+                echo "[cx-kimi-tmux] TUI 就绪 pane=$pane_id,注入 bootstrap"
+            fi
+        elif [ "$injected" = 0 ]; then
+            inject_prompt "$bootstrap_tui"; inj_rc=$?
+            case "$inj_rc" in
+                0) injected=1; echo "[cx-kimi-tmux] bootstrap 已注入 pane=$pane_id" ;;
+                2) entry_fail "inject-partial=$pane_id" \
+                       "bootstrap 只投进去半截(重投会让模型收到重复提示词,故不重投),请看窗格现场" ;;
+                *) printf '=== %s 注入失败(重试) ===\n' "$(date '+%F %T')" >> "$report.entry.log" 2>/dev/null || true
+                   sleep 2 ;;
+            esac
+        elif entry_wire_check; then
+            entered=1
+            echo "[cx-kimi-tmux] 已确认任务进入执行 pane=$pane_id sid=${discovered_sid:-?}"
+        fi
+        if [ "$SECONDS" -ge "$entry_deadline" ]; then
+            entry_fail "entry-timeout=${entry_timeout}s pane=$pane_id" \
+                "${entry_timeout}s 内未完成启动/注入/进入执行(卡屏?)"
+        fi
+    fi
+    [ "$entered" = 1 ] && break
+    sleep 1.5
+done
+
+# ---------- 启动后看门狗:盯 done/pane 死亡/超时 ----------
+start=$SECONDS last_seen_state=running
+while [ ! -e "$report.done" ]; do
+    st=$(read_state "$report")
+    if [ "$st" != "$last_seen_state" ]; then
+        echo "[cx-kimi-tmux] state=$st pane=$pane_id"
+        last_seen_state="$st"
+    fi
+    if [ "$st" = failed ]; then
+        capture
+        echo "cx-kimi-tmux: hook/finalize 失败,见 $report.notify.error 与 $panelog" >&2
+        exit 2
+    fi
+    dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
+    if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
+        sleep 1; [ -e "$report.done" ] && break
+        capture
+        write_state "$report" failed "pane-dead=$pane_id"
+        rmdir "$report.run" 2>/dev/null || true
+        echo "cx-kimi-tmux: Kimi pane 已死亡但未交付,现场见 $panelog" >&2
+        exit 2
+    fi
+    # needs-input 状态下补一次 entry 检查(可能模型第一回合没写报告就结束了)
+    if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
+        capture
+        write_state "$report" detached "timeout=${timeout}s pane=$pane_id"
+        echo "cx-kimi-tmux: 等待 ${timeout}s 超时;Kimi 继续运行,hook 完成后会独立生成报告" >&2
+        exit 124
+    fi
+    sleep 2
+done
+trap - INT TERM HUP
+
+capture
+sid=""
+[ -s "$report.meta.json" ] && sid=$(json_scalar "$report.meta.json" session_id) || sid=""
+if [ "$close_pane" = 1 ]; then tmux kill-pane -t "$pane_id" 2>/dev/null || true; reg_prune || true; fi
+echo "[cx-kimi-tmux] 已交付 report=$report session=$sid pane=$pane_id"
+exit 0

@@ -1,0 +1,1068 @@
+#!/usr/bin/env bash
+# cx-cursor-tmux — 在 tmux pane/window 中运行可视 Cursor Agent TUI,以 stop hook / 报告文件交付结果。
+# Adapted from DittoWii/cx-kimi-tmux (itself a Codex port of cc-kimi-tmux).
+# Copyright notices and MIT terms: ../../../LICENSE; changes: ../../../UPSTREAM.md.
+# 默认面向已有外部隔离边界的自动化环境:以 --force --trust 姿态启动,免审批免追问。
+
+set -u
+umask 077
+
+SELF=$(realpath -m -- "$0" 2>/dev/null || printf '%s' "$0")
+REG_DIR="${CX_CURSOR_TMUX_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/cx-cursor-tmux}"
+REG="$REG_DIR/registry.tsv"       # pane_id, title, report, cwd, started, color
+SESS="$REG_DIR/sessions.tsv"      # session_id, cwd, report, epoch, mode
+WATCH_DIR="$REG_DIR/watch"        # <session_id> -> report 路径(hook 的无 env 兜底)
+REG_LOCK="$REG_DIR/registry.lock"
+CU_COLORS=(colour208 colour45 colour171 colour118 colour214 colour87 colour203 colour155)
+CU_HOME="${CURSOR_HOME:-$HOME/.cursor}"
+
+die() { echo "cx-cursor-tmux: $*" >&2; exit 2; }
+
+usage() {
+    cat <<'EOF'
+cx-cursor-tmux — 在 tmux pane/window 中运行可视 Cursor Agent TUI,并用 stop hook / 报告文件自动交付。
+
+用法:
+  cx-cursor-tmux -t TITLE -o REPORT [-C DIR] [--brief FILE] [--timeout S] [--close] [--] [AGENT FLAGS]
+  cx-cursor-tmux --resume <SESSION_ID|last> -t TITLE -o REPORT [--brief FILE] [--] [AGENT FLAGS]
+  cx-cursor-tmux list
+  cx-cursor-tmux kill <TITLE|%PANE|done|all>
+  cx-cursor-tmux doctor [--live]      自检:依赖 / hook 注入 / 登录状态
+  --target %PANE                显式指定要在旁边分窗的 tmux pane (Codex app 可用)
+
+自动化默认值:
+  CX_CURSOR_TMUX_APPROVAL=auto   auto=--force --trust;yolo=--yolo --trust;manual=原生交互
+  CX_CURSOR_TMUX_REQUIRE_REPORT=1  仅在 REPORT 非空后交付;缺失时标记"待输入"并继续等待
+  CX_CURSOR_TMUX_MODE=pane         pane | window | exec
+  CX_CURSOR_TMUX_ENV_FILE=<路径>    给被派发的 agent 追加/覆盖环境(最后 source)
+EOF
+}
+
+tsv_safe() {
+    case "$1" in *$'\t'*|*$'\n'*|*$'\r'*) return 1 ;; *) return 0 ;; esac
+}
+
+atomic_write() { # stdin -> $1
+    local dest="$1" tmp="${1}.tmp.$$"
+    (umask 077; cat > "$tmp") || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$dest"
+}
+
+atomic_copy() {
+    local src="$1" dest="$2" tmp="${2}.tmp.$$"
+    (umask 077; cp -- "$src" "$tmp") || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$dest"
+}
+
+atomic_touch() {
+    local dest="$1" tmp="${1}.tmp.$$"
+    (umask 077; : > "$tmp") || return 1
+    mv -f -- "$tmp" "$dest"
+}
+
+write_state() {
+    local report="$1" state="$2" detail="${3:-}" tmp="${1}.state.tmp.$$"
+    detail=${detail//$'\t'/ }
+    detail=${detail//$'\n'/ }
+    detail=${detail//$'\r'/ }
+    (umask 077; printf '%s\t%s\t%s\n' "$state" "$(date +%s)" "$detail" > "$tmp") || return 1
+    mv -f -- "$tmp" "$report.state"
+}
+
+read_state() {
+    local report="$1" state=""
+    if [ -s "$report.state" ]; then IFS=$'\t' read -r state _ < "$report.state" || true; fi
+    printf '%s' "$state"
+}
+
+derive_evidence() {
+    case "$1" in
+        *.report.md) printf '%s.evidence.md' "${1%.report.md}" ;;
+        *)           printf '%s.evidence.md' "$1" ;;
+    esac
+}
+
+# ---------- registry/session lock ----------
+REG_LOCK_KIND="" REG_LOCK_FD="" REG_LOCK_DIR="${REG_LOCK}.d"
+
+reg_lock_acquire() {
+    mkdir -p -- "$REG_DIR" || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec {REG_LOCK_FD}>"$REG_LOCK" || return 1
+        flock "$REG_LOCK_FD" || return 1
+        REG_LOCK_KIND=flock
+        return 0
+    fi
+    local i owner
+    for ((i=0; i<200; i++)); do
+        if mkdir "$REG_LOCK_DIR" 2>/dev/null; then
+            (umask 077; printf '%s\n' "$$" > "$REG_LOCK_DIR/pid")
+            REG_LOCK_KIND=mkdir
+            return 0
+        fi
+        owner=""
+        [ -r "$REG_LOCK_DIR/pid" ] && read -r owner < "$REG_LOCK_DIR/pid" || true
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -f -- "$REG_LOCK_DIR/pid"
+            rmdir "$REG_LOCK_DIR" 2>/dev/null || true
+        fi
+        sleep 0.05
+    done
+    echo "cx-cursor-tmux: registry lock 超时" >&2
+    return 1
+}
+
+reg_lock_release() {
+    case "$REG_LOCK_KIND" in
+        flock)
+            flock -u "$REG_LOCK_FD" 2>/dev/null || true
+            exec {REG_LOCK_FD}>&-
+            ;;
+        mkdir)
+            rm -f -- "$REG_LOCK_DIR/pid"
+            rmdir "$REG_LOCK_DIR" 2>/dev/null || true
+            ;;
+    esac
+    REG_LOCK_KIND="" REG_LOCK_FD=""
+}
+
+reg_prune_unlocked() {
+    [ -s "$REG" ] || return 0
+    local live tmp="${REG}.tmp.$$"
+    if ! live=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null); then
+        return 0
+    fi
+    awk -F'\t' -v live="$live" \
+        'BEGIN{n=split(live,a,"\n");for(i=1;i<=n;i++)L[a[i]]=1} ($1 in L)' \
+        "$REG" > "$tmp" 2>/dev/null || : > "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$REG"
+}
+
+reg_prune() {
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    reg_lock_release
+}
+
+reg_snapshot() {
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    [ -s "$REG" ] && cat "$REG"
+    reg_lock_release
+}
+
+reg_add() {
+    local pane="$1" title="$2" report="$3" cwd="$4" started="$5" color="$6"
+    local tmp="${REG}.tmp.$$"
+    reg_lock_acquire || return 1
+    reg_prune_unlocked
+    if [ -s "$REG" ]; then
+        awk -F'\t' -v p="$pane" -v r="$report" '$1!=p && $3!=r' "$REG" > "$tmp"
+    else
+        : > "$tmp"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$title" "$report" "$cwd" "$started" "$color" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$REG"
+    reg_lock_release
+}
+
+pane_for_report() {
+    local report="$1"
+    reg_lock_acquire || return 1
+    [ -s "$REG" ] && awk -F'\t' -v r="$report" '$3==r{print $1; exit}' "$REG"
+    reg_lock_release
+}
+
+color_for_report() {
+    local report="$1"
+    reg_lock_acquire || return 1
+    [ -s "$REG" ] && awk -F'\t' -v r="$report" '$3==r{print $6; exit}' "$REG"
+    reg_lock_release
+}
+
+report_in_use() {
+    local report="$1" found=1
+    reg_lock_acquire || return 0
+    reg_prune_unlocked
+    if [ -s "$REG" ] && awk -F'\t' -v r="$report" '$3==r{found=1} END{exit !found}' "$REG"; then found=0; fi
+    reg_lock_release
+    return "$found"
+}
+
+session_update() {
+    local sid="$1" cwd="$2" report="$3" mode="$4" tmp="${SESS}.tmp.$$"
+    [ -n "$sid" ] || return 0
+    tsv_safe "$sid" && tsv_safe "$cwd" && tsv_safe "$report" || return 0
+    reg_lock_acquire || return 1
+    if [ -s "$SESS" ]; then awk -F'\t' -v id="$sid" '$1!=id' "$SESS" > "$tmp"; else : > "$tmp"; fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$report" "$(date +%s)" "$mode" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$SESS"
+    reg_lock_release
+}
+
+session_lookup() {
+    local id="$1"
+    reg_lock_acquire || return 1
+    [ -s "$SESS" ] && awk -F'\t' -v id="$id" '$1==id{line=$0} END{if(line!="")print line}' "$SESS"
+    reg_lock_release
+}
+
+session_last() {
+    reg_lock_acquire || return 1
+    [ -s "$SESS" ] && tail -n 1 "$SESS"
+    reg_lock_release
+}
+
+# ---------- JSON payload helpers ----------
+JSON_ENGINE=""
+choose_json_engine() {
+    [ -n "$JSON_ENGINE" ] && return 0
+    if command -v node >/dev/null 2>&1; then JSON_ENGINE=node
+    elif command -v python3 >/dev/null 2>&1; then JSON_ENGINE=python3
+    elif command -v jq >/dev/null 2>&1; then JSON_ENGINE=jq
+    else return 1
+    fi
+}
+
+json_scalar() {
+    local src="$1" key="$2"; choose_json_engine || JSON_ENGINE=grep
+    case "$JSON_ENGINE" in
+        node) node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(String(j[process.argv[2]]??""))' "$src" "$key" ;;
+        python3) python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); v=j.get(sys.argv[2],""); sys.stdout.write(str(v if v is not None else ""))' "$src" "$key" ;;
+        jq) jq -r --arg k "$key" '.[$k] // empty' "$src" ;;
+        grep) grep -o "\"$key\":\"[^\"]*\"" "$src" 2>/dev/null | head -1 | sed "s/^\"$key\":\"//;s/\"\$//" ;;
+    esac
+}
+
+exec_extract_last() {
+    local events="$1" dest="$2" tmp="${2}.tmp.$$"; choose_json_engine || return 1
+    python3 -c 'import json,sys
+last=""
+def text_of(j):
+    if isinstance(j.get("content"), str) and j["content"]: return j["content"]
+    msg=j.get("message") or {}
+    c=msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(c, str) and c: return c
+    if isinstance(c, list):
+        parts=[]
+        for b in c:
+            if isinstance(b, dict) and b.get("type")=="text" and b.get("text"): parts.append(b["text"])
+        return "".join(parts)
+    if isinstance(j.get("result"), str) and j["result"]: return j["result"]
+    return ""
+for ln in open(sys.argv[1], errors="replace"):
+    ln=ln.strip()
+    if not ln: continue
+    try: j=json.loads(ln)
+    except Exception: continue
+    t=text_of(j)
+    if t and (j.get("role")=="assistant" or j.get("type") in ("assistant","result") or "result" in j):
+        last=t
+sys.stdout.write(last)' "$events" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
+exec_extract_sid() {
+    local events="$1"
+    python3 -c 'import json,sys
+s=""
+keys=("session_id","conversation_id","chatId","chat_id")
+for ln in open(sys.argv[1], errors="replace"):
+    ln=ln.strip()
+    if not ln: continue
+    try: j=json.loads(ln)
+    except Exception: continue
+    for k in keys:
+        v=j.get(k)
+        if v: s=str(v)
+    msg=j.get("message") if isinstance(j.get("message"), dict) else {}
+    for k in keys:
+        v=msg.get(k)
+        if v: s=str(v)
+sys.stdout.write(s)' "$events"
+}
+
+json_write_meta() {
+    local src="$1" dest="$2" mode="$3" pane="$4" title="$5" report="$6" evidence="$7"
+    local tmp="${2}.tmp.$$"
+    python3 -c 'import json,sys,os,datetime
+src,mode,pane,title,report,evidence=sys.argv[1:]
+j=json.load(open(src))
+sid=j.get("session_id") or j.get("conversation_id") or j.get("chatId") or ""
+cwd=j.get("cwd") or ""
+o={"schema_version":2,"status":"delivered","type":j.get("hook_event_name") or j.get("event") or "stop",
+   "session_id":sid,"cwd":cwd,"client":j.get("client_type",""),"mode":mode,"pane":pane,"title":title,
+   "report":report,"evidence":evidence,
+   "evidence_present":os.path.exists(evidence) and os.path.getsize(evidence)>0,
+   "completed_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}
+print(json.dumps(o,ensure_ascii=False,indent=2))' \
+        "$src" "$mode" "$pane" "$title" "$report" "$evidence" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
+}
+
+append_footer() {
+    local report="$1" json="$2" meta="$3" pane="$4" mode="$5" sid cwd
+    grep -q '^\[cx-cursor-tmux\] session-id:' "$report" 2>/dev/null && return 0
+    sid=$(json_scalar "$json" session_id) || sid=""
+    [ -n "$sid" ] || sid=$(json_scalar "$json" conversation_id) || sid=""
+    cwd=$(json_scalar "$json" cwd) || cwd=""
+    {
+        printf '\n---\n[cx-cursor-tmux] 完成 %s  mode=%s pane=%s\n' "$(date '+%F %T')" "$mode" "${pane:--}"
+        [ -n "$sid" ] && printf '[cx-cursor-tmux] session-id: %s\n' "$sid"
+        [ -n "$cwd" ] && printf '[cx-cursor-tmux] cwd: %s\n' "$cwd"
+        [ -n "$sid" ] && printf '[cx-cursor-tmux] 续聊: cx-cursor-tmux --resume %s -t <任务名> -o <终报> --brief <追问文件>\n' "$sid"
+        printf '[cx-cursor-tmux] meta: %s\n' "$meta"
+    } >> "$report"
+}
+
+finalize_payload() {
+    local report="$1" json="$2" mode="$3" pane="$4" title="$5" fallback="$6"
+    local last="$report.last.md" meta="$report.meta.json" evidence sid cwd tmp
+    evidence=$(derive_evidence "$report")
+
+    if [ ! -s "$report" ]; then
+        [ "$fallback" = 1 ] || return 3
+        tmp="${report}.tmp.$$"
+        [ -s "$last" ] || return 3
+        cp -- "$last" "$tmp" || return 1
+        mv -f -- "$tmp" "$report"
+    fi
+
+    json_write_meta "$json" "$meta" "$mode" "$pane" "$title" "$report" "$evidence" || return 1
+    append_footer "$report" "$json" "$meta" "$pane" "$mode" || return 1
+    sid=$(json_scalar "$json" session_id) || sid=""
+    [ -n "$sid" ] || sid=$(json_scalar "$json" conversation_id) || sid=""
+    cwd=$(json_scalar "$json" cwd) || cwd=""
+    session_update "$sid" "$cwd" "$report" "$mode" || return 1
+    if [ -s "$evidence" ]; then write_state "$report" delivered "sid=$sid"
+    else write_state "$report" delivered "sid=$sid evidence-missing=$evidence"; fi
+    return 0
+}
+
+mark_watch() {
+    local sid="$1" report="$2"
+    [ -n "$sid" ] || return 0
+    mkdir -p -- "$WATCH_DIR" && printf '%s' "$report" > "$WATCH_DIR/$sid" 2>/dev/null || true
+}
+
+deliver_now() {
+    local report="$1" payload="$2" title="$3" mode="$4" close_pane="$5" require_report="$6"
+    local pane claim latest
+    [ -s "$report.state" ] || return 0
+    [ -d "$report.claim" ] && return 0
+    if [ "$require_report" = 1 ] && [ ! -s "$report" ]; then
+        write_state "$report" needs-input "report-missing"
+        return 0
+    fi
+    if ! mkdir "$report.claim" 2>/dev/null; then return 0; fi
+    latest="$report.latest.stop.json"
+    if ! printf '%s' "$payload" | atomic_write "$latest"; then
+        write_state "$report" failed "hook-write"; rmdir "$report.claim" 2>/dev/null || true; return 2
+    fi
+    pane=$(pane_for_report "$report")
+    if ! finalize_payload "$report" "$latest" "$mode" "$pane" "$title" "$((1-require_report))"; then
+        write_state "$report" failed "finalize"
+        rmdir "$report.claim" 2>/dev/null || true
+        return 2
+    fi
+    atomic_touch "$report.done" || { write_state "$report" failed "done-write"; return 2; }
+    rmdir "$report.run" 2>/dev/null || true
+    if [ -n "$pane" ] && command -v tmux >/dev/null 2>&1; then
+        tmux capture-pane -p -S - -t "$pane" > "$report.pane.log" 2>/dev/null || true
+        chmod 600 "$report.pane.log" 2>/dev/null || true
+        local cu_label cu_color
+        cu_label="cxcu:${title//\#/##}"
+        cu_color=$(color_for_report "$report"); [ -n "$cu_color" ] || cu_color=colour208
+        tmux select-pane -t "$pane" -T "$cu_label ✅" 2>/dev/null || true
+        tmux set-option -p -t "$pane" @cxcu_label "#[fg=$cu_color,bold] $cu_label ✅ #[default]" 2>/dev/null || true
+        tmux set-option -p -t "$pane" remain-on-exit off 2>/dev/null || true
+        if [ "$close_pane" = 1 ]; then
+            (sleep 0.2; tmux kill-pane -t "$pane" 2>/dev/null || true) &
+        fi
+    fi
+    return 0
+}
+
+# ---------- hook 入口(由 ~/.cursor/hooks.json 调用) ----------
+# 归属只认派发进程的 CX_CURSOR_TMUX_REPORT;普通 Cursor / IDE 会话立即退出。
+hook_entry() {
+    local payload="$1" event sid cwd report title mode require_report close_pane status
+
+    [ -n "${CX_CURSOR_TMUX_REPORT:-}" ] || return 0
+    event=$(json_scalar <(printf '%s' "$payload") hook_event_name) || event=""
+    [ -n "$event" ] || event=$(json_scalar <(printf '%s' "$payload") event) || event=""
+    sid=$(json_scalar <(printf '%s' "$payload") session_id) || sid=""
+    [ -n "$sid" ] || sid=$(json_scalar <(printf '%s' "$payload") conversation_id) || sid=""
+    cwd=$(json_scalar <(printf '%s' "$payload") cwd) || cwd=""
+    status=$(json_scalar <(printf '%s' "$payload") status) || status=""
+
+    report="${CX_CURSOR_TMUX_REPORT:-}"
+    [ -n "$report" ] || return 0
+    [ -s "$report.state" ] || return 0
+    [ -d "$report.claim" ] && return 0
+
+    case "$event" in
+        sessionStart|SessionStart)
+            mark_watch "$sid" "$report"
+            return 0
+            ;;
+        postToolUseFailure)
+            printf '%s\n' "$payload" >> "$report.entry.log" 2>/dev/null || true
+            return 0
+            ;;
+    esac
+
+    if [ "$status" = error ] || [ "$event" = StopFailure ]; then
+        write_state "$report" failed "stop-failure:${status:-unknown} sid=$sid"
+        printf '%s\n' "$payload" >> "$report.entry.log" 2>/dev/null || true
+        return 0
+    fi
+    if [ "$status" = aborted ] || [ "$event" = Interrupt ]; then
+        write_state "$report" needs-input "user-interrupt; sid=$sid; 等下一回合"
+        return 0
+    fi
+    case "$event" in
+        stop|Stop|sessionEnd|SessionEnd|"") ;;
+        *) return 0 ;;
+    esac
+    [ "${CX_CURSOR_TMUX_MODE_KEPT:-pane}" != exec ] || return 0
+
+    title="${CX_CURSOR_TMUX_TITLE:-$(basename "$report")}"
+    mode="${CX_CURSOR_TMUX_MODE_KEPT:-pane}"
+    close_pane="${CX_CURSOR_TMUX_CLOSE_DONE_KEPT:-0}"
+    require_report="${CX_CURSOR_TMUX_REQUIRE_REPORT:-1}"
+    mark_watch "$sid" "$report"
+    deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"
+}
+
+resolve_resume() {
+    local row="" sid="" cwd="" rep="" epoch="" smode=""
+    if [ "$resume_id" = last ]; then row=$(session_last) || true; else row=$(session_lookup "$resume_id") || true; fi
+    if [ -n "$row" ]; then
+        IFS=$'\t' read -r sid cwd rep epoch smode <<< "$row"
+        resume_id="$sid"
+        if [ "$workdir_set" = 0 ] && [ -n "$cwd" ] && [ -d "$cwd" ]; then workdir="$cwd"; workdir_set=1; fi
+        return 0
+    fi
+    [ "$resume_id" = last ] && return 1
+    return 0
+}
+
+state_label() {
+    case "$1" in
+        starting) echo 启动中 ;; running) echo 运行中 ;; needs-input) echo 待输入 ;;
+        detached) echo 后台运行 ;; delivered) echo 已交付 ;; failed) echo 失败 ;;
+        killed) echo 已关闭 ;; *) echo "$1" ;;
+    esac
+}
+
+cmd_list() {
+    local rows pid t rep wd ts color st loc sid
+    rows=$(reg_snapshot) || return 1
+    [ -n "$rows" ] || { echo "(无登记的 Cursor pane)"; return 0; }
+    {
+        printf 'PANE\t任务\t状态\t位置\t启动\tSESSION\t终报\n'
+        while IFS=$'\t' read -r pid t rep wd ts color; do
+            [ -n "$pid" ] || continue
+            st=$(read_state "$rep")
+            [ -n "$st" ] || { [ -e "$rep.done" ] && st=delivered || st=running; }
+            if [ "$(tmux display-message -p -t "$pid" '#{pane_dead}' 2>/dev/null)" = 1 ] && [ "$st" != delivered ]; then st=failed; fi
+            loc=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null) || loc='?'
+            sid=""; [ -s "$rep.meta.json" ] && sid=$(json_scalar "$rep.meta.json" session_id 2>/dev/null) || true
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$t" "$(state_label "$st")" "$loc" "$ts" "${sid:0:18}" "$rep"
+        done <<< "$rows"
+    } | { column -t -s "$(printf '\t')" 2>/dev/null || cat; }
+}
+
+cmd_kill() {
+    local sel="${1:-}" rows pid t rep wd ts color win n=0 h st
+    local -a hits=() wins=()
+    [ -n "$sel" ] || { echo "用法: cx-cursor-tmux kill <任务名|%pane_id|done|all>" >&2; return 2; }
+    sel="${sel#cxcu:}"
+    rows=$(reg_snapshot) || return 1
+    [ -n "$rows" ] || { echo "(无登记的 Cursor pane)"; return 1; }
+    while IFS=$'\t' read -r pid t rep wd ts color; do
+        st=$(read_state "$rep"); [ -n "$st" ] || { [ -e "$rep.done" ] && st=delivered || st=running; }
+        case "$sel" in
+            all) hits+=("$pid"$'\t'"$t"$'\t'"$rep") ;;
+            done) [ "$st" = delivered ] && hits+=("$pid"$'\t'"$t"$'\t'"$rep") ;;
+            *) if [ "$sel" = "$pid" ] || [ "$sel" = "$t" ]; then hits+=("$pid"$'\t'"$t"$'\t'"$rep"); fi ;;
+        esac
+    done <<< "$rows"
+    ((${#hits[@]})) || { echo "cx-cursor-tmux: 没有匹配 '$sel' 的 pane" >&2; return 1; }
+    if [ "$sel" != all ] && [ "$sel" != done ] && [ ${#hits[@]} -gt 1 ]; then
+        echo "cx-cursor-tmux: '$sel' 命中多个,请改用 %pane_id" >&2; return 3
+    fi
+    for h in "${hits[@]}"; do
+        IFS=$'\t' read -r pid t rep <<< "$h"
+        win=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}' 2>/dev/null) || win=""
+        [ -n "$win" ] && wins+=("$win")
+        if tmux kill-pane -t "$pid" 2>/dev/null; then
+            st=$(read_state "$rep"); [ "$st" = delivered ] || write_state "$rep" killed "pane=$pid"
+            rmdir "$rep.run" 2>/dev/null || true
+            echo "已关闭 $pid $t"; n=$((n+1))
+        fi
+    done
+    reg_prune
+    for win in "${wins[@]}"; do rebalance "$win"; done
+    [ "$n" -gt 0 ]
+}
+
+registered_panes_in_window() {
+    local win="$1" rows pid t rep wd ts color pwin
+    rows=$(reg_snapshot) || return 1
+    while IFS=$'\t' read -r pid t rep wd ts color; do
+        [ -n "$pid" ] || continue
+        pwin=$(tmux display-message -p -t "$pid" '#{session_name}:#{window_index}' 2>/dev/null) || continue
+        [ "$pwin" = "$win" ] && printf '%s\n' "$pid"
+    done <<< "$rows"
+}
+
+rebalance() {
+    local win="$1" p main="" n
+    local -a all=() cx=()
+    [ "${CX_CURSOR_TMUX_LAYOUT:-main-vertical}" = none ] && return 0
+    mapfile -t all < <(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null)
+    mapfile -t cx < <(registered_panes_in_window "$win")
+    n=${#all[@]}
+    [ "$n" -gt 2 ] || return 0
+    [ "$n" -eq $(( ${#cx[@]} + 1 )) ] || return 0
+    for p in "${all[@]}"; do
+        if ! printf '%s\n' "${cx[@]}" | grep -qxF "$p"; then main="$p"; break; fi
+    done
+    [ -n "$main" ] || return 0
+    tmux select-layout -t "$win" main-vertical 2>/dev/null || true
+    tmux resize-pane -t "$main" -x "${CX_CURSOR_TMUX_MAIN_WIDTH:-60%}" 2>/dev/null || true
+}
+
+resolve_agent_bin() {
+    local cand path ver
+    for cand in cursor-agent agent; do
+        path=$(command -v "$cand" 2>/dev/null) || continue
+        ver=$("$path" --version 2>/dev/null | head -1) || ver=""
+        case "$cand:$ver" in
+            cursor-agent:*) printf '%s' "$path"; return 0 ;;
+            agent:20[0-9][0-9].*) printf '%s' "$path"; return 0 ;;
+            agent:*[Cc]ursor*) printf '%s' "$path"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+DOC_WARN=0 DOC_FAIL=0
+if [ -t 1 ]; then DOC_G=$'\033[32m' DOC_Y=$'\033[33m' DOC_R=$'\033[31m' DOC_0=$'\033[0m'
+else DOC_G="" DOC_Y="" DOC_R="" DOC_0=""; fi
+doc_ok()   { printf '  %s✓%s %s\n' "$DOC_G" "$DOC_0" "$*"; }
+doc_warn() { printf '  %s!%s %s\n' "$DOC_Y" "$DOC_0" "$*"; DOC_WARN=$((DOC_WARN+1)); }
+doc_fail() { printf '  %s✗%s %s\n' "$DOC_R" "$DOC_0" "$*"; DOC_FAIL=$((DOC_FAIL+1)); }
+
+cmd_doctor() {
+    local live=0 cfg="$CU_HOME/hooks.json" agent_bin auth
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --live) live=1; shift ;;
+            -h|--help) echo "用法: cx-cursor-tmux doctor [--live]"; return 0 ;;
+            *) die "doctor: 未知参数 $1" ;;
+        esac
+    done
+
+    echo "cx-cursor-tmux doctor"
+    echo "[1] 依赖"
+    if agent_bin=$(resolve_agent_bin); then
+        doc_ok "Cursor Agent CLI $("$agent_bin" --version 2>/dev/null | head -1)  ($agent_bin)"
+    else
+        doc_fail "未找到 Cursor Agent CLI(cursor-agent 或 agent)"
+        agent_bin=""
+    fi
+    if command -v tmux >/dev/null 2>&1; then doc_ok "tmux $(tmux -V 2>/dev/null | awk '{print $2}')"
+    else doc_warn "未找到 tmux —— 派发会降级为 exec 无头模式"; fi
+    command -v python3 >/dev/null 2>&1 && doc_ok "python3" || doc_fail "需要 python3 >= 3.9"
+    command -v awk >/dev/null 2>&1 && doc_ok "awk" || doc_fail "缺 awk"
+
+    echo "[2] stop hook 注入"
+    if [ ! -f "$cfg" ]; then doc_fail "找不到 $cfg —— 先跑一次 install.sh"
+    elif python3 "$(dirname "$SELF")/configure.py" check --hooks-only >/dev/null 2>&1; then
+        doc_ok "sessionStart / stop / sessionEnd hooks 有效"
+    else
+        doc_fail "本插件 hook 不完整或路径已失效;重跑 install.sh"
+    fi
+
+    echo "[3] 登录"
+    if [ -n "$agent_bin" ]; then
+        auth=$(timeout --kill-after=2 20 "$agent_bin" status --format json 2>/dev/null) || auth=""
+        if printf '%s' "$auth" | grep -qiE '"loggedIn"[[:space:]]*:[[:space:]]*true|"isAuthenticated"[[:space:]]*:[[:space:]]*true|authenticated|logged in'; then
+            doc_ok "agent status 显示已登录"
+        elif timeout --kill-after=2 20 "$agent_bin" status >/dev/null 2>&1; then
+            doc_ok "agent status 可执行"
+        else
+            doc_warn "无法确认登录;请先运行 agent login"
+        fi
+    fi
+
+    if [ "$live" = 1 ]; then
+        echo "[4] live prompt"
+        if [ -z "$agent_bin" ]; then doc_fail "无 agent,跳过 live"
+        else
+            local tmp
+            tmp=$(mktemp)
+            if timeout --kill-after=5 "${CX_CURSOR_TMUX_DOCTOR_LIVE_TIMEOUT:-90}" \
+                "$agent_bin" -p --output-format text --force --trust --sandbox disabled \
+                "Reply with exactly: CX_CURSOR_TMUX_PONG" > "$tmp" 2>/dev/null; then
+                if grep -q CX_CURSOR_TMUX_PONG "$tmp"; then doc_ok "live prompt 成功"
+                else doc_warn "live prompt 已返回但未看到约定字符串;见 $tmp"; fi
+            else
+                doc_fail "live prompt 失败或超时"
+            fi
+            rm -f -- "$tmp"
+        fi
+    fi
+
+    printf '\n结果: %d 项失败, %d 项警告\n' "$DOC_FAIL" "$DOC_WARN"
+    [ "$DOC_FAIL" = 0 ] || { echo "详见 docs/TROUBLESHOOTING.md"; return 2; }
+    [ "$DOC_WARN" = 0 ] || return 1
+    return 0
+}
+
+case "${1:-}" in
+    __stop_hook)
+        payload=$(cat 2>/dev/null) || payload=""
+        [ -n "$payload" ] || exit 0
+        hook_entry "$payload" || true
+        exit 0
+        ;;
+    list|ls) shift; cmd_list "$@"; exit $? ;;
+    doctor|check) shift; cmd_doctor "$@"; exit $? ;;
+    kill|close|rm) shift; cmd_kill "$@"; exit $? ;;
+esac
+
+# ---------- dispatch 参数解析 ----------
+title="" report="" workdir="$PWD" workdir_set=0 brief_src="" resume_id=""
+target_override="${CX_CURSOR_TMUX_TARGET:-}"
+mode="${CX_CURSOR_TMUX_MODE:-pane}" close_pane="${CX_CURSOR_TMUX_CLOSE_DONE:-0}" timeout="${CX_CURSOR_TMUX_TIMEOUT:-0}"
+require_report="${CX_CURSOR_TMUX_REQUIRE_REPORT:-1}"
+approval="${CX_CURSOR_TMUX_APPROVAL:-auto}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t) [ $# -ge 2 ] || die "-t 缺少值"; title="$2"; shift 2 ;;
+        -o) [ $# -ge 2 ] || die "-o 缺少值"; report="$2"; shift 2 ;;
+        -C) [ $# -ge 2 ] || die "-C 缺少值"; workdir="$2"; workdir_set=1; shift 2 ;;
+        --brief) [ $# -ge 2 ] || die "--brief 缺少值"; brief_src="$2"; shift 2 ;;
+        --resume) [ $# -ge 2 ] || die "--resume 缺少值"; resume_id="$2"; shift 2 ;;
+        --target) [ $# -ge 2 ] || die "--target 缺少值"; target_override="$2"; shift 2 ;;
+        -w|--window) mode=window; shift ;;
+        --close) close_pane=1; shift ;;
+        --timeout) [ $# -ge 2 ] || die "--timeout 缺少值"; timeout="$2"; shift 2 ;;
+        --allow-last-message) require_report=0; shift ;;
+        --) shift; break ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "未知参数 $1(Cursor flags 请放在 -- 之后)" ;;
+    esac
+done
+extra=("$@")
+
+[ -n "$report" ] || die "缺少 -o REPORT"
+case "$mode" in pane|window|exec) ;; *) die "CX_CURSOR_TMUX_MODE 必须是 pane、window 或 exec" ;; esac
+case "$approval" in auto|yolo|manual) ;; *) die "CX_CURSOR_TMUX_APPROVAL 必须是 auto、yolo 或 manual" ;; esac
+[[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout 必须是非负整数秒"
+case "$require_report" in 0|1) ;; *) die "CX_CURSOR_TMUX_REQUIRE_REPORT 必须是 0 或 1" ;; esac
+case "$close_pane" in 0|1) ;; *) die "CX_CURSOR_TMUX_CLOSE_DONE 必须是 0 或 1" ;; esac
+tsv_safe "$title" || die "任务标题不能包含 tab/newline"
+tsv_safe "$report" || die "报告路径不能包含 tab/newline"
+tsv_safe "$workdir" || die "工作目录不能包含 tab/newline"
+
+for f in "${extra[@]}"; do
+    case "$f" in
+        -p*|--print|--print=*|--output-format|--output-format=*|--resume|--resume=*|--continue|--continue=*|--force|--force=*|--yolo|--yolo=*|--trust|--trust=*|--workspace|--workspace=*|--sandbox|--sandbox=*|--approve-mcps|--approve-mcps=*)
+            die "Cursor flag '$f' 由 cx-cursor-tmux 管理,不能重复传入" ;;
+    esac
+done
+
+agent_bin=$(resolve_agent_bin) || die "未找到 Cursor Agent CLI(安装 cursor-agent 或 agent,并确认 agent --version 为 Cursor)"
+command -v python3 >/dev/null 2>&1 || die "需要 python3 >= 3.9"
+
+env_file="${CX_CURSOR_TMUX_ENV_FILE:-}"
+if [ -n "$env_file" ]; then
+    env_file=$(realpath -m -- "$env_file")
+    [ -r "$env_file" ] || die "CX_CURSOR_TMUX_ENV_FILE 不可读: $env_file"
+fi
+
+report=$(realpath -m -- "$report")
+mkdir -p -- "$(dirname "$report")" || die "无法创建报告目录"
+[ -n "$title" ] || { title=$(basename "$report"); title="${title%%.*}"; }
+tsv_safe "$title" || die "任务标题不能包含 tab/newline"
+
+find_current_tmux_pane() {
+    [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] && { printf '%s' "$TMUX_PANE"; return 0; }
+    command -v tmux >/dev/null 2>&1 || return 1
+    local tty="" pane="" pid="" ppid=""
+    tty=$(tty 2>/dev/null) || tty=""
+    if [ -n "$tty" ]; then
+        pane=$(tmux list-panes -a -F '#{pane_tty} #{pane_id}' 2>/dev/null \
+            | awk -v t="$tty" '$1==t{print $2; exit}')
+        [ -n "$pane" ] && { printf '%s' "$pane"; return 0; }
+    fi
+    pid=$$
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+        pane=$(tmux list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null \
+            | awk -v p="$pid" '$1==p{print $2; exit}')
+        [ -n "$pane" ] && { printf '%s' "$pane"; return 0; }
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || ppid=""
+        [ -n "$ppid" ] && [ "$ppid" != "$pid" ] || break
+        pid=$ppid
+    done
+    return 1
+}
+
+target=""
+if [ "$mode" != exec ]; then
+    if command -v tmux >/dev/null 2>&1; then
+        if [ -n "$target_override" ]; then
+            target=$(tmux display-message -p -t "$target_override" '#{pane_id}' 2>/dev/null) || die "无效的 tmux target: $target_override"
+            [ -n "$target" ] || die "无效的 tmux target: $target_override"
+        else target=$(find_current_tmux_pane); fi
+        [ -n "$target" ] || mode=exec
+    else
+        [ -z "$target_override" ] || die "--target 需要 tmux"
+        mode=exec
+    fi
+fi
+
+if [ -n "$resume_id" ]; then
+    resolve_resume || { [ "$resume_id" = last ] && die "无法解析 last 会话;请传明确 session-id" || true; }
+fi
+if [ "$mode" = exec ] && [ "$approval" != auto ]; then
+    die "无头模式不兼容交互审批;请用 tmux pane/window，或设置 CX_CURSOR_TMUX_APPROVAL=auto"
+fi
+if [ "$workdir_set" = 1 ]; then
+    [ -d "$workdir" ] || die "工作目录不存在: $workdir"
+    workdir=$(realpath -m -- "$workdir")
+elif [ -z "$resume_id" ]; then
+    workdir=$(realpath -m -- "$workdir")
+fi
+if [ -n "$resume_id" ] && [ "$mode" != exec ] && [ "$workdir_set" = 0 ]; then
+    die "无法恢复 resume 会话 cwd;请显式传 -C"
+fi
+
+if report_in_use "$report"; then die "报告路径正在被另一个 pane 使用: $report"; fi
+[ ! -d "$report.run" ] || die "报告路径已有活动 run lock: $report.run"
+
+evidence=$(derive_evidence "$report")
+if [ -n "$brief_src" ]; then
+    brief_src=$(realpath -m -- "$brief_src")
+    [ -s "$brief_src" ] || die "简报为空或不存在: $brief_src"
+    for reserved in "$report" "$evidence" "$report.done" "$report.stop.json" "$report.latest.stop.json" \
+        "$report.last.md" "$report.meta.json" "$report.state" "$report.notify.error" \
+        "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" "$report.gate" "$report.entry.log"; do
+        [ "$brief_src" != "$(realpath -m -- "$reserved")" ] || die "简报路径与输出文件冲突: $brief_src"
+    done
+fi
+mkdir "$report.run" || die "无法建立 run lock: $report.run"
+chmod 700 "$report.run" 2>/dev/null || true
+rmdir "$report.claim" 2>/dev/null || true
+rm -f -- "$report" "$evidence" "$report.done" "$report.stop.json" "$report.latest.stop.json" \
+    "$report.last.md" "$report.meta.json" "$report.state" "$report.notify.error" \
+    "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" \
+    "$report.gate" "$report.entry.log"
+[ "$brief_src" = "$report.brief" ] 2>/dev/null || rm -f -- "$report.brief"
+write_state "$report" starting "mode=$mode"
+atomic_touch "$report.stamp"
+
+brief="$report.brief"
+if [ -n "$brief_src" ]; then
+    if [ "$brief_src" != "$brief" ]; then
+        atomic_copy "$brief_src" "$brief" || { rmdir "$report.run"; die "无法复制简报"; }
+    fi
+else
+    atomic_write "$brief" || { rmdir "$report.run"; die "无法从 stdin 写入简报"; }
+fi
+[ -s "$brief" ] || { rmdir "$report.run"; die "简报为空"; }
+
+panelog="$report.pane.log" events="$report.events.jsonl"
+gate="$report.gate" launch_sh="$report.launch.sh"
+
+bootstrap_exec="阅读并原样执行简报文件: $brief 。仅当任务真正完成时,把最终摘要(结论/交付物/偏差,≤50行)写入: $report ,详细证据写入: $evidence 。禁止反问、直接执行到底。不要只写摘要来反问——需要澄清就在对话里说明并停下等待。"
+
+approval_args() {
+    case "$approval" in
+        auto) printf '%s\n' --force --trust --approve-mcps --sandbox disabled ;;
+        yolo) printf '%s\n' --yolo --trust --approve-mcps ;;
+        manual) return 0 ;;
+    esac
+}
+
+# ---------- exec 无头模式 ----------
+if [ "$mode" = exec ]; then
+    write_state "$report" running "mode=exec"
+    mapfile -t auto_args < <(approval_args)
+    prompt_text="$bootstrap_exec"$'\n\n'"$(cat -- "$brief")"
+    cmd=("$agent_bin" -p --output-format stream-json --workspace "$workdir")
+    cmd+=("${auto_args[@]}")
+    [ -n "$resume_id" ] && cmd+=(--resume "$resume_id")
+    cmd+=("${extra[@]}" "$prompt_text")
+    if [ "$timeout" -gt 0 ]; then
+        command -v timeout >/dev/null 2>&1 || { rmdir "$report.run"; die "无头超时需要 GNU timeout"; }
+        cmd=(timeout --kill-after=5 "$timeout" "${cmd[@]}")
+    fi
+    (
+        cd "$workdir" || exit 2
+        export CX_CURSOR_TMUX_REPORT="$report" CX_CURSOR_TMUX_TITLE="$title" CX_CURSOR_TMUX_MODE_KEPT=exec
+        export CX_CURSOR_TMUX_CLOSE_DONE_KEPT=0 CX_CURSOR_TMUX_REQUIRE_REPORT="$require_report"
+        unset CX_KIMI_TMUX_REPORT
+        unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
+        [ -n "$env_file" ] && { . "$env_file" || exit 2; }
+        exec "${cmd[@]}"
+    ) < /dev/null > "$events" 2> "$panelog"
+    ec=$?
+
+    sid=$(exec_extract_sid "$events") || sid=""
+    exec_extract_last "$events" "$report.last.md" 2>/dev/null || true
+
+    if [ "$ec" -eq 0 ] && [ "$(read_state "$report")" = failed ]; then ec=2; fi
+    if [ "$ec" -ne 0 ]; then
+        write_state "$report" failed "exec=$ec"
+        rmdir "$report.run" 2>/dev/null || true
+        echo "[cx-cursor-tmux] exec 失败 exit=$ec 日志=$panelog 事件=$events" >&2
+        exit "$ec"
+    fi
+
+    if [ ! -e "$report.done" ]; then
+        if mkdir "$report.claim" 2>/dev/null; then
+            canonical="$report.stop.json"
+            python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id=sys.argv[1],cwd=sys.argv[2],client_type="cursor_agent_cli_exec",status="completed")))' \
+                "$sid" "$workdir" | atomic_write "$canonical"
+            finalize_payload "$report" "$canonical" exec "" "$title" "$((1-require_report))" || {
+                write_state "$report" failed "exec-finalize: report missing or invalid"; rmdir "$report.claim" "$report.run" 2>/dev/null || true
+                die "Cursor 未写报告或报告交付失败;检查 $events;仅需最后回复时可加 --allow-last-message"
+            }
+            atomic_touch "$report.done"
+            rmdir "$report.run" 2>/dev/null || true
+        else
+            for _cu_i in {1..240}; do [ -e "$report.done" ] && break; sleep 0.5; done
+        fi
+    fi
+    [ -e "$report.done" ] || { write_state "$report" failed "finalize-timeout"; rmdir "$report.run" 2>/dev/null || true; die "报告交付超时"; }
+    echo "[cx-cursor-tmux] exec 已交付 report=$report session=$sid"
+    exit 0
+fi
+
+# ---------- 生成 launch.sh ----------
+mapfile -t launch_args < <(approval_args)
+launch_args+=(--workspace "$workdir")
+[ -n "$resume_id" ] && launch_args+=(--resume "$resume_id")
+launch_args+=("${extra[@]}" "$bootstrap_exec")
+
+{
+    printf '#!/usr/bin/env bash\nset -u\n'
+    printf 'cd %q || exit 2\n' "$workdir"
+    printf 'unset CX_KIMI_TMUX_REPORT\n'
+    printf 'export CX_CURSOR_TMUX_REPORT=%q CX_CURSOR_TMUX_TITLE=%q CX_CURSOR_TMUX_MODE_KEPT=%q\n' "$report" "$title" "$mode"
+    printf 'export CX_CURSOR_TMUX_CLOSE_DONE_KEPT=%q CX_CURSOR_TMUX_REQUIRE_REPORT=%q\n' "$close_pane" "$require_report"
+    for _cu_v in HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy; do
+        printf 'unset %s 2>/dev/null || true\n' "$_cu_v"
+    done
+    for _cu_v in CURSOR_HOME CURSOR_API_KEY CURSOR_API_ENDPOINT CX_CURSOR_TMUX_CACHE_DIR XDG_CACHE_HOME; do
+        if [ -n "${!_cu_v:-}" ]; then printf 'export %s=%q\n' "$_cu_v" "${!_cu_v}"; else printf 'unset %s 2>/dev/null || true\n' "$_cu_v"; fi
+    done
+    printf 'export PATH=%q\n' "$PATH"
+    [ -n "$env_file" ] && printf '. %q || { echo "cx-cursor-tmux: 加载 CX_CURSOR_TMUX_ENV_FILE 失败: %s" >&2; exit 2; }\n' "$env_file" "$env_file"
+    printf 'for _cu_i in {1..200}; do [ -e %q ] && break; sleep 0.05; done\n' "$gate"
+    printf 'exec %q' "$agent_bin"
+    printf ' %q' "${launch_args[@]}"
+    printf '\n'
+} > "$launch_sh"
+chmod 700 "$launch_sh"
+
+pane_id="" win="" nw_target="" color="" started=$(date '+%F %T')
+printf -v panecmd 'exec bash %q' "$launch_sh"
+if [ "$mode" = pane ]; then
+    if [ -n "$target" ]; then win=$(tmux display-message -p -t "$target" '#{session_name}:#{window_index}' 2>/dev/null) || win=""
+    else win=$(tmux display-message -p '#{session_name}:#{window_index}' 2>/dev/null) || win=""; fi
+    mapfile -t cxp < <(registered_panes_in_window "$win")
+    if [ ${#cxp[@]} -eq 0 ]; then
+        split_target="$target"
+        [ -n "$split_target" ] || split_target="$win"
+        pane_id=$(tmux split-window -d -t "$split_target" -h -l "${CX_CURSOR_TMUX_PANE_WIDTH:-40%}" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    else
+        c=${#cxp[@]}; p="${cxp[$(( (c - 1) / 2 ))]}"; dir=-h; [ $((c % 2)) = 1 ] && dir=-v
+        pane_id=$(tmux split-window -d -t "$p" "$dir" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    fi
+fi
+if [ -z "$pane_id" ]; then
+    nw_target=""
+    [ -n "$target" ] && { nw_target=$(tmux display-message -p -t "$target" '#{session_name}:#{window_index}' 2>/dev/null) || nw_target=""; }
+    [ -n "$nw_target" ] || nw_target="$win"
+    if [ -n "$nw_target" ]; then
+        pane_id=$(tmux new-window -d -a -t "$nw_target" -n "cxcu:$title" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    fi
+    [ -n "$pane_id" ] || pane_id=$(tmux new-window -d -n "cxcu:$title" -P -F '#{pane_id}' -- "$panecmd" 2>/dev/null) || pane_id=""
+    mode=window
+fi
+if [ -z "$pane_id" ]; then
+    write_state "$report" failed "tmux-launch"
+    rmdir "$report.run" 2>/dev/null || true
+    die "无法创建 tmux pane/window"
+fi
+
+rows=$(reg_snapshot) || rows=""; ncx=0; [ -n "$rows" ] && ncx=$(printf '%s\n' "$rows" | grep -c .)
+color=${CU_COLORS[$(( ncx % ${#CU_COLORS[@]} ))]}
+cu_label="cxcu:${title//\#/##}"
+tmux select-pane -t "$pane_id" -T "$cu_label" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" pane-border-style "fg=$color" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" pane-active-border-style "fg=$color" 2>/dev/null || true
+tmux set-option -p -t "$pane_id" @cxcu_label "#[fg=$color,bold] $cu_label #[default]" 2>/dev/null || true
+tmux set-option -w -t "$pane_id" pane-border-format '#{?@cxcu_label,#{@cxcu_label},#{pane_title}}' 2>/dev/null || true
+tmux set-option -w -t "$pane_id" allow-rename off 2>/dev/null || true
+tmux set-option -p -t "$pane_id" remain-on-exit on 2>/dev/null || true
+tmux set-option -w -t "$pane_id" pane-border-status top 2>/dev/null || true
+if [ -n "$resume_id" ]; then mark_watch "$resume_id" "$report"; fi
+reg_add "$pane_id" "$title" "$report" "$workdir" "$started" "$color" || true
+[ "$mode" = pane ] && [ -n "$win" ] && rebalance "$win"
+write_state "$report" running "pane=$pane_id mode=$mode"
+atomic_touch "$gate"
+echo "[cx-cursor-tmux] pane=$pane_id title=cxcu:$title color=$color 启动:$launch_sh"
+
+capture() {
+    (umask 077; tmux capture-pane -p -S - -t "$pane_id" > "$panelog" 2>/dev/null) || true
+}
+
+detached_by_signal=0
+on_detach_signal() {
+    detached_by_signal=1
+    write_state "$report" detached "signal; pane=$pane_id"
+    echo "cx-cursor-tmux: wrapper 收到信号,Cursor 继续在 pane=$pane_id 运行;hook 仍会独立交付" >&2
+    exit 130
+}
+trap on_detach_signal INT TERM HUP
+
+pane_scr() { tmux capture-pane -p -t "$pane_id" 2>/dev/null || true; }
+
+dismiss_trust_if_present() {
+    [ "$approval" != manual ] || return 1
+    local scr="$1"
+    if printf '%s' "$scr" | grep -qiE 'Trust this workspace|Do you trust|trust this folder'; then
+        printf '=== %s 信任弹窗自动确认 ===\n' "$(date '+%F %T')" >> "$report.entry.log" 2>/dev/null || true
+        tmux send-keys -t "$pane_id" Enter 2>/dev/null || true
+        echo "[cx-cursor-tmux] 检测到信任弹窗,已按 Enter pane=$pane_id"
+        return 0
+    fi
+    return 1
+}
+
+pane_ready() {
+    local scr
+    scr=$(pane_scr) || return 1
+    dismiss_trust_if_present "$scr" && return 1
+    printf '%s' "$scr" | grep -qiE 'Add a follow-up|Composer|cursor-agent|Agent|ctrl\+c to stop|❯' ||
+    printf '%s' "$scr" | grep -qE '─────'
+}
+
+tui_idle() {
+    local scr
+    scr=$(pane_scr) || return 1
+    printf '%s' "$scr" | grep -qiE 'Add a follow-up' && ! printf '%s' "$scr" | grep -qiE 'ctrl\+c to stop'
+}
+
+entry_timeout=${CX_CURSOR_TMUX_ENTRY_TIMEOUT:-120}
+entry_deadline=$((SECONDS + entry_timeout))
+entered=0 ready=0
+
+entry_fail() {
+    capture
+    write_state "$report" failed "$1"
+    rmdir "$report.run" 2>/dev/null || true
+    echo "cx-cursor-tmux: $2;现场见 $panelog 与 $report.entry.log" >&2
+    exit 2
+}
+
+while :; do
+    if [ "$entered" = 0 ]; then
+        if [ -e "$report.done" ]; then
+            entered=1
+            echo "[cx-cursor-tmux] 启动期内已交付 pane=$pane_id"
+        else
+            dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
+            if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
+                sleep 1
+                if [ -e "$report.done" ]; then entered=1
+                else entry_fail "pane-dead-at-entry=$pane_id" "Cursor 窗格在启动期就死了且未交付(先看 pane.log 首行)"; fi
+            fi
+        fi
+    fi
+    if [ "$entered" = 0 ]; then
+        if [ "$ready" = 0 ] && pane_ready; then
+            ready=1
+            echo "[cx-cursor-tmux] TUI 就绪 pane=$pane_id"
+        fi
+        if [ "$ready" = 1 ]; then
+            entered=1
+            echo "[cx-cursor-tmux] 已确认任务进入执行 pane=$pane_id"
+        fi
+        if [ "$SECONDS" -ge "$entry_deadline" ]; then
+            entry_fail "entry-timeout=${entry_timeout}s pane=$pane_id" \
+                "${entry_timeout}s 内未完成启动(卡屏?)"
+        fi
+    fi
+    [ "$entered" = 1 ] && break
+    sleep 1.5
+done
+
+start=$SECONDS last_seen_state=running idle_hits=0
+while [ ! -e "$report.done" ]; do
+    st=$(read_state "$report")
+    if [ "$st" != "$last_seen_state" ]; then
+        echo "[cx-cursor-tmux] state=$st pane=$pane_id"
+        last_seen_state="$st"
+    fi
+    if [ "$st" = failed ]; then
+        capture
+        echo "cx-cursor-tmux: hook/finalize 失败,见 $report.notify.error 与 $panelog" >&2
+        exit 2
+    fi
+    dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
+    if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
+        sleep 1; [ -e "$report.done" ] && break
+        if [ -s "$report" ]; then
+            python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_tui",status="completed")))' \
+                "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"; }
+            [ -e "$report.done" ] && break
+        fi
+        capture
+        write_state "$report" failed "pane-dead=$pane_id"
+        rmdir "$report.run" 2>/dev/null || true
+        echo "cx-cursor-tmux: Cursor pane 已死亡但未交付,现场见 $panelog" >&2
+        exit 2
+    fi
+    # CLI 的 stop hook 并不总是触发:报告已落盘且 TUI 回到 follow-up 即视为完成。
+    if [ -s "$report" ] && tui_idle; then
+        idle_hits=$((idle_hits + 1))
+        if [ "$idle_hits" -ge 2 ]; then
+            python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_tui_idle",status="completed")))' \
+                "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"; }
+        fi
+    else
+        idle_hits=0
+        if tui_idle && [ ! -s "$report" ] && [ "$st" != needs-input ]; then
+            write_state "$report" needs-input "report-missing; tui idle"
+        fi
+    fi
+    if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
+        capture
+        write_state "$report" detached "timeout=${timeout}s pane=$pane_id"
+        echo "cx-cursor-tmux: 等待 ${timeout}s 超时;Cursor 继续运行,hook 完成后会独立生成报告" >&2
+        exit 124
+    fi
+    sleep 2
+done
+trap - INT TERM HUP
+
+capture
+sid=""
+[ -s "$report.meta.json" ] && sid=$(json_scalar "$report.meta.json" session_id) || sid=""
+if [ "$close_pane" = 1 ]; then tmux kill-pane -t "$pane_id" 2>/dev/null || true; reg_prune || true; fi
+echo "[cx-cursor-tmux] 已交付 report=$report session=$sid pane=$pane_id"
+exit 0
