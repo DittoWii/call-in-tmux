@@ -385,7 +385,21 @@ deliver_now() {
             (sleep 0.2; tmux kill-pane -t "$pane" 2>/dev/null || true) &
         fi
     fi
+    wake_host "$title" "$report" "$pane"
     return 0
+}
+
+wake_host() {
+    local title="$1" report="$2" child="${3:-}"
+    local wake bin
+    bin="${CALL_IN_TMUX_ROOT:-}"
+    if [ -z "$bin" ]; then
+        bin=$(cd -- "$(dirname -- "$SELF")/../.." && pwd)
+    fi
+    wake="$bin/bin/wake-host"
+    [ -x "$wake" ] || return 0
+    [ -n "${CALL_IN_TMUX_HOST_PANE:-}" ] || return 0
+    CALL_IN_TMUX_CHILD_PANE="$child" bash "$wake" "$CALL_IN_TMUX_HOST_PANE" "$title" "$report" || true
 }
 
 # ---------- hook 入口(由 ~/.cursor/hooks.json 调用) ----------
@@ -633,6 +647,25 @@ case "${1:-}" in
         payload=$(cat 2>/dev/null) || payload=""
         [ -n "$payload" ] || exit 0
         hook_entry "$payload" || true
+        exit 0
+        ;;
+    __finish)
+        # 补交已经写好、但等待进程已退出的报告,并唤醒宿主。
+        # 用法: cursor-tmux __finish REPORT TITLE WORKDIR HOST_PANE
+        report=$(realpath -m -- "${2:-}") || exit 2
+        title="${3:-task}"
+        workdir="${4:-$(dirname -- "$report")}"
+        export CALL_IN_TMUX_HOST_PANE="${5:-${CALL_IN_TMUX_HOST_PANE:-}}"
+        [ -s "$report" ] || { echo "报告为空: $report" >&2; exit 2; }
+        if [ ! -e "$report.done" ]; then
+            [ -s "$report.state" ] || write_state "$report" detached "manual-finish"
+            python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_late",status="completed")))' \
+                "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" pane "" 1; }
+        else
+            wake_host "$title" "$report" ""
+        fi
+        [ -e "$report.done" ] || exit 2
+        echo "[cx-cursor-tmux] 补交完成 report=$report"
         exit 0
         ;;
     list|ls) shift; cmd_list "$@"; exit $? ;;
@@ -961,10 +994,18 @@ pane_ready() {
     printf '%s' "$scr" | grep -qE '─────'
 }
 
+tui_busy() {
+    local scr="$1"
+    # 底栏常驻的 "ctrl+c to stop" 不是忙碌。只认进行中的状态行。
+    printf '%s' "$scr" | grep -qiE 'Working \(|esc to interrupt|Generating|Running '
+}
+
 tui_idle() {
     local scr
     scr=$(pane_scr) || return 1
-    printf '%s' "$scr" | grep -qiE 'Add a follow-up' && ! printf '%s' "$scr" | grep -qiE 'ctrl\+c to stop'
+    printf '%s' "$scr" | grep -qiE 'Add a follow-up' || return 1
+    tui_busy "$scr" && return 1
+    return 0
 }
 
 entry_timeout=${CX_CURSOR_TMUX_ENTRY_TIMEOUT:-120}
@@ -1050,10 +1091,38 @@ while [ ! -e "$report.done" ]; do
             write_state "$report" needs-input "report-missing; tui idle"
         fi
     fi
-    if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
+    if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ] && [ "${CALL_IN_TMUX_LINGER_CHILD:-}" != 1 ]; then
         capture
-        write_state "$report" detached "timeout=${timeout}s pane=$pane_id"
-        echo "cx-cursor-tmux: 等待 ${timeout}s 超时;Cursor 继续运行,hook 完成后会独立生成报告" >&2
+        write_state "$report" detached "timeout=${timeout}s pane=$pane_id linger"
+        echo "cx-cursor-tmux: 等待 ${timeout}s 超时;前台返回 124。后台继续等到交付,再唤醒宿主窗格。" >&2
+        (
+            trap - INT TERM HUP
+            export CALL_IN_TMUX_LINGER_CHILD=1
+            timeout=0
+            idle_hits=0
+            while [ ! -e "$report.done" ]; do
+                dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
+                if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
+                    sleep 1
+                    if [ -s "$report" ] && [ ! -e "$report.done" ]; then
+                        python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_tui",status="completed")))' \
+                            "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"; }
+                    fi
+                    break
+                fi
+                if [ -s "$report" ] && tui_idle; then
+                    idle_hits=$((idle_hits + 1))
+                    if [ "$idle_hits" -ge 2 ]; then
+                        python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_tui_idle",status="completed")))' \
+                            "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"; }
+                    fi
+                else
+                    idle_hits=0
+                fi
+                sleep 2
+            done
+        ) >/tmp/cx-cursor-linger.$$.log 2>&1 &
+        disown || true
         exit 124
     fi
     sleep 2

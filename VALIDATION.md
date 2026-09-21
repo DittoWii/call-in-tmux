@@ -1,13 +1,16 @@
 # Validation
 
-**2026-09-21** — self-contained vendoring.
+**2026-09-21** — self-contained install + Codex/Kimi smokes (Claude skipped by request).
 
 | Check | Result |
 | --- | --- |
 | Unit tests | 5 passed |
-| Matrix runners | All resolve under `call-in-tmux/engines/` only (no sibling cx/cc paths) |
-| Install | CLI + `call` skills + cursor/kimi-cc/kimi-cx hooks |
-| Codex cleanup | Removed `cx-kimi-tmux@personal` plugin and `~/.agents/skills/cursor` |
-| Doctors | cursor hooks check OK; kimi cc/cx doctor green |
+| Matrix runners | All under `call-in-tmux/engines/` |
+| Install (codex+kimi) | CLI + `$call` skills; cursor + kimi-cx hooks |
+| Codex→Cursor smoke | exit 0; `CALL_IN_TMUX_CODEX_CURSOR_OK`; `.done` |
+| Codex→Kimi smoke | exit 0; `CALL_IN_TMUX_CODEX_KIMI_OK`; `.done` |
+| Kimi→Cursor smoke | exit 0; `CALL_IN_TMUX_KIMI_CURSOR_OK`; `.done` |
+| Claude | Not installed / not tested |
+| Cleanup | Removed Claude `call` + old `~/.claude/skills/kimi`; removed kimi-cc hooks; no Codex `cx-*` plugin/skill |
 
-Runtime no longer requires checkouts of `cx-cursor-tmux`, `cx-kimi-tmux`, or `cc-kimi-tmux`.
+Artifacts under `.runs/` (gitignored).

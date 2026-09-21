@@ -2,6 +2,12 @@
 
 > One self-contained doorway for agent-to-agent calls over tmux. Say「调用 cursor / 让 kimi / 派给 codex」— no separate `cx-*` / `cc-*` skills required.
 
+Inspired by [huanglune/cc-codex-tmux](https://github.com/huanglune/cc-codex-tmux): split a tmux pane, send another CLI agent the brief, and return with a written report. This repo keeps that workflow and extends it into a host × engine matrix (Claude / Codex / Kimi calling Codex / Cursor / Kimi).
+
+![Two Codex tasks running in parallel tmux panes alongside Claude Code](docs/screenshot-cc-codex-tmux.png)
+
+<p align="center"><sub>Screenshot from <a href="https://github.com/huanglune/cc-codex-tmux">huanglune/cc-codex-tmux</a> — Codex panes beside Claude Code. Same tmux-dispatch idea; we reuse it across more hosts and engines.</sub></p>
+
 Engine scripts are **vendored** under `engines/`. This repo runs on its own after `install.sh`.
 
 ## Supported edges

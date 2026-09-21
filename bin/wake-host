@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Notify the calling agent's tmux pane that a delegated task finished.
+# Usage: wake-host <pane_id> <title> <report>
+set -u
+pane="${1:-}"
+title="${2:-task}"
+report="${3:-}"
+[ -n "$pane" ] || exit 0
+[ -n "$report" ] || exit 0
+command -v tmux >/dev/null 2>&1 || exit 0
+alive=$(tmux display-message -p -t "$pane" '#{pane_id}' 2>/dev/null) || exit 0
+[ -n "$alive" ] || exit 0
+# Never paste into the callee pane.
+child="${CALL_IN_TMUX_CHILD_PANE:-}"
+[ -z "$child" ] || [ "$child" != "$pane" ] || exit 0
+
+msg=$(printf 'call-in-tmux: 子任务 %s 已结束。请阅读报告后继续审核或给出下一步。报告: %s' "$title" "$report")
+tmux set-buffer -b citwake -- "$msg" 2>/dev/null || exit 0
+tmux paste-buffer -d -b citwake -t "$pane" 2>/dev/null || exit 0
+sleep 0.4
+tmux send-keys -t "$pane" Enter
+echo "[call-in-tmux] 已唤醒宿主 pane=$pane" >&2
+exit 0

@@ -23,9 +23,9 @@ CALL_IN_TMUX_HOST=codex call-in-tmux to <cursor|kimi> \
   --brief /absolute/reports/<名>.brief.md --timeout 900
 ```
 
-在 `exec_command` 里设较短 `yield_time_ms`(如 1000);若返回命令 `session_id`,保留并用 `write_stdin` 等待完成(单次≤60s)。不要假设回合结束后自动唤醒。命令 session id ≠ 后端 agent session id。
+不要提前结束本回合。`exec_command` 必须等到 `call-in-tmux` 退出再读报告(把 `yield_time_ms` 设得足够大,或循环 `write_stdin` 直到进程结束)。退出 0 后确认 `.done`,读报告与 `.meta.json`,再决定审核通过还是给下一步;不要停在「已派发」。
 
-退出 0 后确认 `.done`,读报告与 `.meta.json`;改代码时核对 diff。
+若因 `--timeout` 先返回 124:子任务仍在跑,后台会在它真正写完报告后把一句 `call-in-tmux: 子任务 … 已结束` 贴回本窗格。看到这句话就去读报告并继续,不要干等。命令 session id ≠ 后端 agent session id。
 
 ## 续聊与管理
 

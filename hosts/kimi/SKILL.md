@@ -20,7 +20,7 @@ CALL_IN_TMUX_HOST=kimi call-in-tmux to cursor \
   --brief /absolute/reports/<名>.brief.md --timeout 900
 ```
 
-简报自包含;要求 Cursor 写 `.report.md` + `.evidence.md`;禁止反问。派发后等进程退出(或轮询 `.done`),再读摘要。
+简报自包含;要求 Cursor 写 `.report.md` + `.evidence.md`;禁止反问。必须等 `call-in-tmux` 进程退出后再读摘要并继续(审核或下一步),不要在派发后结束本回合。若超时先返回,看到窗格里 `call-in-tmux: 子任务 … 已结束` 再读报告。
 
 ## 续聊与管理
 

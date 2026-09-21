@@ -4,6 +4,8 @@
 
 ## Lineage
 
+The tmux-pane dispatch + written-report pattern is inspired by [huanglune/cc-codex-tmux](https://github.com/huanglune/cc-codex-tmux) (screenshot vendored as `docs/screenshot-cc-codex-tmux.png`).
+
 ```text
 huanglune/cc-codex-tmux     → engines/codex/codex-tmux
 DittoWii/cc-kimi-tmux       → engines/kimi/cc/*

@@ -151,6 +151,10 @@ forward_engine() {
     ensure_edge "$host" "$engine"
     runner=$(resolve_runner "$host" "$engine")
     echo "[call-in-tmux] $host → $engine via $runner" >&2
+    if [ -z "${CALL_IN_TMUX_HOST_PANE:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+        export CALL_IN_TMUX_HOST_PANE="$TMUX_PANE"
+    fi
+    export CALL_IN_TMUX_ROOT
     exec bash "$runner" "$@"
 }
 

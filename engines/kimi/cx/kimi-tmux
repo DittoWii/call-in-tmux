@@ -1316,10 +1316,27 @@ while [ ! -e "$report.done" ]; do
         exit 2
     fi
     # needs-input 状态下补一次 entry 检查(可能模型第一回合没写报告就结束了)
-    if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
+    if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ] && [ "${CALL_IN_TMUX_LINGER_CHILD:-}" != 1 ]; then
         capture
-        write_state "$report" detached "timeout=${timeout}s pane=$pane_id"
-        echo "cx-kimi-tmux: 等待 ${timeout}s 超时;Kimi 继续运行,hook 完成后会独立生成报告" >&2
+        write_state "$report" detached "timeout=${timeout}s pane=$pane_id linger"
+        echo "cx-kimi-tmux: 等待 ${timeout}s 超时;前台返回 124。后台继续等到交付,再唤醒宿主窗格。" >&2
+        (
+            trap - INT TERM HUP
+            export CALL_IN_TMUX_LINGER_CHILD=1
+            while [ ! -e "$report.done" ]; do
+                dead=$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null) || dead=gone
+                if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
+                    sleep 1
+                    break
+                fi
+                sleep 2
+            done
+            if [ -e "$report.done" ] && [ -n "${CALL_IN_TMUX_HOST_PANE:-}" ]; then
+                root=$(cd -- "$(dirname -- "$SELF")/../../.." && pwd)
+                CALL_IN_TMUX_CHILD_PANE="$pane_id" bash "$root/bin/wake-host" "$CALL_IN_TMUX_HOST_PANE" "$title" "$report" || true
+            fi
+        ) >/tmp/cx-kimi-linger.$$.log 2>&1 &
+        disown || true
         exit 124
     fi
     sleep 2
