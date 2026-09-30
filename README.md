@@ -31,8 +31,10 @@ call-in-tmux matrix
 This installs:
 
 1. `~/.local/bin/call-in-tmux`
-2. Host skill `call` for Claude / Codex / Kimi
-3. Engine hooks from **this repo** (`engines/cursor`, `engines/kimi/cc`, `engines/kimi/cx`)
+2. Host skill `call` for Claude / Codex / Kimi (Claude: `${CLAUDE_CONFIG_DIR:-~/.claude}/skills/call`)
+3. Engine hooks from **this repo**, only for engines the chosen hosts can reach (`engines/cursor`, `engines/kimi/cx`)
+
+Under cac (one `CLAUDE_CONFIG_DIR` per env), run `bash install.sh --host claude --skills-only` once inside each env.
 
 Do **not** install Codex plugins `cx-kimi-tmux` / `cx-cursor-tmux` as separate skills — use `$call` only.
 
@@ -41,6 +43,11 @@ Do **not** install Codex plugins `cx-kimi-tmux` / `cx-cursor-tmux` as separate s
 ```bash
 CALL_IN_TMUX_HOST=codex call-in-tmux to cursor \
   -t review -C /abs/project -o /abs/out.report.md --brief /abs/out.brief.md --timeout 900
+
+# Claude: run in background, no --timeout; engine-native flags go after --
+CALL_IN_TMUX_HOST=claude call-in-tmux to codex \
+  -t review -C /abs/project -o /abs/out.report.md --brief /abs/out.brief.md \
+  -- -c 'model_reasoning_effort="max"'
 
 call-in-tmux matrix
 call-in-tmux resolve kimi --from codex
@@ -61,8 +68,8 @@ bin/call-in-tmux          router CLI
 config/matrix.json        edges + runners (all under engines/)
 engines/codex/            vendored codex-tmux
 engines/cursor/           vendored cursor-tmux + hooks installer
-engines/kimi/cc/          vendored cc-kimi dispatcher + hooks
-engines/kimi/cx/          vendored cx-kimi dispatcher + hooks
+engines/kimi/cx/          vendored cx-kimi dispatcher + hooks (all hosts → kimi)
+engines/kimi/cc/          legacy cc-kimi dispatcher; not routed, not installed
 hosts/{claude,codex,kimi} thin skills (wake semantics only)
 ```
 

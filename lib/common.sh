@@ -4,30 +4,6 @@ set -u
 
 cit_die() { echo "call-in-tmux: $*" >&2; exit 2; }
 
-cit_root() {
-    local self
-    self=$(realpath -m -- "${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}" 2>/dev/null || printf '%s' "${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}")
-    # lib/common.sh → repo root
-    dirname -- "$(dirname -- "$self")"
-}
-
-cit_expand() {
-    # Expand ${HOME}, ${CALL_IN_TMUX_WORKSPACE}, ${CALL_IN_TMUX_ROOT}, ~ 
-    local s="$1" root workspace
-    root="${CALL_IN_TMUX_ROOT:-}"
-    [ -n "$root" ] || root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-    workspace="${CALL_IN_TMUX_WORKSPACE:-$(dirname -- "$root")}"
-    s=${s//\$\{HOME\}/$HOME}
-    s=${s//\$HOME/$HOME}
-    s=${s//\$\{CALL_IN_TMUX_ROOT\}/$root}
-    s=${s//\$\{CALL_IN_TMUX_WORKSPACE\}/$workspace}
-    case "$s" in
-        ~/*) s="$HOME/${s#~/}" ;;
-        ~) s="$HOME" ;;
-    esac
-    printf '%s' "$s"
-}
-
 cit_matrix_file() {
     if [ -n "${CALL_IN_TMUX_MATRIX:-}" ] && [ -f "$CALL_IN_TMUX_MATRIX" ]; then
         printf '%s' "$CALL_IN_TMUX_MATRIX"
@@ -41,22 +17,23 @@ cit_matrix_file() {
 
 cit_json_py() {
     python3 - "$@" <<'PY'
-import json, os, sys
+import json, os, re, sys
 path = sys.argv[1]
 op = sys.argv[2]
 with open(path, encoding="utf-8") as f:
     data = json.load(f)
 
 def expand(s: str) -> str:
+    # ${VAR} / ${VAR:-default} / $HOME / leading ~. Root and workspace are derived
+    # when unset; any other variable comes from the environment (e.g. CLAUDE_CONFIG_DIR).
     root = os.environ.get("CALL_IN_TMUX_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(path)))
-    # If path is user override, still prefer env root when set; else derive from env or sibling of config in repo.
-    if not os.environ.get("CALL_IN_TMUX_ROOT"):
-        # Prefer repo root from CALL_IN_TMUX_ROOT already unset — caller should set it.
-        pass
     workspace = os.environ.get("CALL_IN_TMUX_WORKSPACE") or os.path.dirname(root)
     home = os.path.expanduser("~")
-    s = s.replace("${HOME}", home).replace("$HOME", home)
-    s = s.replace("${CALL_IN_TMUX_ROOT}", root).replace("${CALL_IN_TMUX_WORKSPACE}", workspace)
+    derived = {"CALL_IN_TMUX_ROOT": root, "CALL_IN_TMUX_WORKSPACE": workspace, "HOME": home}
+    def var(m):
+        return derived.get(m.group(1)) or os.environ.get(m.group(1)) or (m.group(2) or "")
+    s = re.sub(r"\$\{(\w+)(?::-([^}]*))?\}", var, s)
+    s = s.replace("$HOME", home)
     if s.startswith("~/"):
         s = os.path.join(home, s[2:])
     elif s == "~":

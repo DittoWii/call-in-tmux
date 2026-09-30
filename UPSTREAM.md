@@ -17,7 +17,9 @@ cx-cursor-tmux              → engines/cursor/*
 
 - `engines/cursor/configure.py`: script name `cursor-tmux`; hook marker `call-in-tmux-cursor`; use `--hooks-only` from top-level install (do not install a separate `$cursor` Codex skill).
 - `engines/kimi/cx/configure.py`: script name `kimi-tmux`; hook marker `call-in-tmux-kimi-cx`.
-- `engines/kimi/cc/install.sh`: hook command `$HERE/kimi-tmux`; marker `call-in-tmux-kimi-cc`.
+- `engines/kimi/cc/install.sh`: hook command `$HERE/kimi-tmux`; marker `call-in-tmux-kimi-cc`. (legacy; no longer routed or installed)
+- `engines/cursor/cursor-tmux`: wake the host pane only from the post-`--timeout` linger waiter (not on every delivery); recover `session_id` from `~/.cursor/projects/*/agent-transcripts/` when the stop hook does not fire; linger log at `$report.linger.log`.
+- `engines/kimi/cx/kimi-tmux`: linger log at `$report.linger.log`.
 
 ## Refresh recipe
 

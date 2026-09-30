@@ -25,7 +25,8 @@ while [ $# -gt 0 ]; do
 用法: install.sh [--host claude|codex|kimi]... [--all-hosts]
                  [--bin-only|--skills-only|--hooks-only|--no-hooks]
 
-默认安装: CLI 链接 + 全部宿主 skill + 引擎 hooks(cursor / kimi-cc / kimi-cx)。
+默认安装: CLI 链接 + 全部宿主 skill + 所选宿主能派发到的引擎 hooks(cursor / kimi)。
+Claude skill 装到 ${CLAUDE_CONFIG_DIR:-~/.claude}/skills/call;cac 多环境时每个环境各跑一次 --host claude。
 引擎脚本全部在本仓库 engines/ 下,不依赖旁路 cx-* / cc-* 仓库。
 EOF
             exit 0
@@ -36,6 +37,11 @@ done
 if [ ${#HOSTS[@]} -eq 0 ]; then
     HOSTS=(claude codex kimi)
 fi
+RESOLVED=()
+for h in "${HOSTS[@]}"; do
+    r=$(cit_json_py "$MATRIX" resolve_host "$h") || { echo "未知宿主 $h" >&2; exit 2; }
+    RESOLVED+=("$r")
+done
 
 if [ "$BIN_LINK" = 1 ]; then
     mkdir -p "$HOME/.local/bin"
@@ -44,8 +50,7 @@ if [ "$BIN_LINK" = 1 ]; then
 fi
 
 if [ "$SKILLS" = 1 ]; then
-    for h in "${HOSTS[@]}"; do
-        h=$(cit_json_py "$MATRIX" resolve_host "$h")
+    for h in "${RESOLVED[@]}"; do
         dest=$(cit_json_py "$MATRIX" skill_install "$h")
         src="$ROOT/hosts/$h"
         [ -d "$src" ] || { echo "缺少 $src" >&2; exit 2; }
@@ -64,12 +69,21 @@ if [ "$SKILLS" = 1 ]; then
 fi
 
 if [ "$HOOKS" = 1 ]; then
-    echo "[hooks] cursor (engines/cursor)"
-    python3 "$ROOT/engines/cursor/configure.py" install --hooks-only
-    echo "[hooks] kimi/cx for Codex→Kimi (engines/kimi/cx)"
-    python3 "$ROOT/engines/kimi/cx/configure.py" install --hooks-only
-    echo "[hooks] kimi/cc for Claude→Kimi (engines/kimi/cc)"
-    bash "$ROOT/engines/kimi/cc/install.sh" || true
+    # 只装所选宿主经矩阵边能到达的引擎;codex 引擎走内联 notify,不需要 hook
+    mapfile -t ENGINES < <(cit_json_py "$MATRIX" edges \
+        | awk -F'\t' -v hs="${RESOLVED[*]}" 'BEGIN{n=split(hs,a," ");for(i=1;i<=n;i++)H[a[i]]=1} ($1 in H){print $2}' | sort -u)
+    for e in "${ENGINES[@]}"; do
+        case "$e" in
+            cursor)
+                echo "[hooks] cursor (engines/cursor)"
+                python3 "$ROOT/engines/cursor/configure.py" install --hooks-only
+                ;;
+            kimi)
+                echo "[hooks] kimi (engines/kimi/cx)"
+                python3 "$ROOT/engines/kimi/cx/configure.py" install --hooks-only
+                ;;
+        esac
+    done
 fi
 
 echo

@@ -22,15 +22,17 @@ call-in-tmux — 在支持的宿主×引擎矩阵上派发任务（tmux 可视 /
 用法:
   call-in-tmux to <engine> [dispatch flags...] [-- engine-native-flags...]
   call-in-tmux list [--to ENGINE]
-  call-in-tmux kill [--to ENGINE] <TITLE|%PANE|done|all>
-  call-in-tmux doctor [--to ENGINE] [--live]
+  call-in-tmux kill --to ENGINE <TITLE|%PANE|done|all>   (done/all 跨会话,会关掉别人的窗格)
+  call-in-tmux doctor --to cursor|kimi [--live]
   call-in-tmux matrix
   call-in-tmux resolve <engine> [--from HOST]
   call-in-tmux which
 
 Dispatch flags (转发给引擎,统一契约):
   -t TITLE  -o REPORT  -C DIR  --brief FILE  --resume ID
-  --target %PANE  -w  --close  --timeout S  --allow-last-message
+  -w  --close  --timeout S  --allow-last-message
+  --target %PANE   (仅 cursor / kimi)
+  -- FLAGS...      引擎原生 flags,例: -- -c 'model_reasoning_effort="max"'
 
 环境:
   CALL_IN_TMUX_HOST=claude|codex|kimi   显式宿主(否则自动探测)
@@ -166,7 +168,8 @@ cmd_to() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --from) host_raw="$2"; shift 2 ;;
-            --) shift; passthrough+=("$@"); break ;;
+            # 引擎自己的 flags 仍要在 -- 之后,否则引擎会当成派发参数拒绝
+            --) passthrough+=("$@"); break ;;
             *) passthrough+=("$1"); shift ;;
         esac
     done
@@ -195,6 +198,9 @@ cmd_mgmt() {
     host=$(pick_host "${CALL_IN_TMUX_HOST:-auto}")
     if [ -n "$to" ]; then
         engine=$(resolve_name engine "$to")
+        if [ "$action" = doctor ] && [ "$engine" = codex ]; then
+            cit_die "codex 引擎没有 doctor 子命令(只有 cursor / kimi 有)"
+        fi
         forward_engine "$host" "$engine" "$action" "${rest[@]}"
     fi
     # No --to: fan-out list across known engines for this host's edges

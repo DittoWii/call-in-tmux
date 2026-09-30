@@ -26,8 +26,10 @@ CALL_IN_TMUX_HOST=kimi call-in-tmux to cursor \
 
 ```bash
 CALL_IN_TMUX_HOST=kimi call-in-tmux to cursor --resume <session-id> -t followup -o /abs/new.report.md --brief /abs/q.brief.md
-call-in-tmux kill --to cursor done
+call-in-tmux kill --to cursor <任务名>
 call-in-tmux matrix
 ```
+
+不要用 `kill … done` / `all`:登记表跨会话共享,会关掉别的会话的窗格。
 
 若矩阵日后增加 `kimi → kimi/codex` 等边,仍走同一入口,只改 `to <engine>`。

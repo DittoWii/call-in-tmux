@@ -897,7 +897,7 @@ if [ -n "$brief_src" ]; then
     [ -s "$brief_src" ] || die "简报为空或不存在: $brief_src"
     for reserved in "$report" "$evidence" "$report.done" "$report.stop.json" "$report.latest.stop.json" \
         "$report.last.md" "$report.meta.json" "$report.state" "$report.notify.error" \
-        "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" "$report.gate" "$report.entry.log"; do
+        "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" "$report.gate" "$report.entry.log" "$report.linger.log"; do
         [ "$brief_src" != "$(realpath -m -- "$reserved")" ] || die "简报路径与输出文件冲突: $brief_src"
     done
 fi
@@ -909,7 +909,7 @@ rmdir "$report.claim" 2>/dev/null || true
 rm -f -- "$report" "$evidence" "$report.done" "$report.stop.json" "$report.latest.stop.json" \
     "$report.last.md" "$report.meta.json" "$report.state" "$report.notify.error" \
     "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" \
-    "$report.gate" "$report.entry.log"
+    "$report.gate" "$report.entry.log" "$report.linger.log"
 [ "$brief_src" = "$report.brief" ] 2>/dev/null || rm -f -- "$report.brief"
 write_state "$report" starting "mode=$mode"
 atomic_touch "$report.stamp"
@@ -1224,11 +1224,13 @@ ready=0 injected=0 entered=0 dismissed=0
 stamp_file="$report.stamp"
 discovered_sid=""
 
-entry_wire_check() { # return 0=任务确认进入执行(该 workdir 有新 wire.jsonl 且有内容)
+entry_wire_check() { # return 0=任务确认进入执行(该 workdir 有含本次尾标的新 wire.jsonl)
     local bucket="$KM_HOME/sessions/$(wd_key "$workdir")" f
     [ -d "$bucket" ] || return 1
-    f=$(find "$bucket" -type f -name wire.jsonl -path '*/agents/main/*' -newer "$stamp_file" 2>/dev/null | head -1)
-    [ -n "$f" ] && [ -s "$f" ] || return 1
+    # 同一 workdir 并发派发时 bucket 里会有别人的新会话;只认含本次 bootstrap 尾标的那个(2026-09-30 实测串号)
+    f=$(find "$bucket" -type f -name wire.jsonl -path '*/agents/main/*' -newer "$stamp_file" 2>/dev/null \
+        | xargs -r grep -lF -- "$(inj_mark)" 2>/dev/null | head -1)
+    [ -n "$f" ] || return 1
     # 顺便捞 session-id 供 watch 兜底与报告
     if [ -z "$discovered_sid" ]; then
         discovered_sid=$(printf '%s' "$f" | sed -n "s|.*/sessions/[^/]*/\([^/]*\)/agents/main/wire.jsonl|\1|p")
@@ -1335,7 +1337,7 @@ while [ ! -e "$report.done" ]; do
                 root=$(cd -- "$(dirname -- "$SELF")/../../.." && pwd)
                 CALL_IN_TMUX_CHILD_PANE="$pane_id" bash "$root/bin/wake-host" "$CALL_IN_TMUX_HOST_PANE" "$title" "$report" || true
             fi
-        ) >/tmp/cx-kimi-linger.$$.log 2>&1 &
+        ) >"$report.linger.log" 2>&1 &
         disown || true
         exit 124
     fi

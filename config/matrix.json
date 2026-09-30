@@ -7,7 +7,7 @@
   "hosts": {
     "claude": {
       "aliases": ["cc", "claude-code", "anthropic"],
-      "skill_install": "~/.claude/skills/call",
+      "skill_install": "${CLAUDE_CONFIG_DIR:-~/.claude}/skills/call",
       "wake": "run_in_background"
     },
     "codex": {
@@ -17,13 +17,13 @@
     },
     "kimi": {
       "aliases": ["km", "kimi-code"],
-      "skill_install": "~/.kimi-code/skills/call",
+      "skill_install": "${KIMI_CODE_HOME:-~/.kimi-code}/skills/call",
       "wake": "stop_hook_or_shell"
     }
   },
   "engines": {
     "codex": {
-      "aliases": ["cx-engine", "gpt", "oai"],
+      "aliases": ["cx", "cx-engine", "gpt", "oai"],
       "label": "cx",
       "runners": {
         "default": ["${CALL_IN_TMUX_ROOT}/engines/codex/codex-tmux"]
@@ -38,12 +38,9 @@
     },
     "kimi": {
       "aliases": ["km", "moonshot"],
-      "label": "km",
+      "label": "cxkm",
       "runners": {
-        "claude": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cc/kimi-tmux"],
-        "codex": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cx/kimi-tmux"],
-        "kimi": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cc/kimi-tmux"],
-        "default": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cc/kimi-tmux"]
+        "default": ["${CALL_IN_TMUX_ROOT}/engines/kimi/cx/kimi-tmux"]
       }
     }
   },
@@ -57,6 +54,7 @@
   ],
   "notes": {
     "self_contained": "All runners live under engines/; no dependency on sibling cx-*/cc-* checkouts at runtime.",
-    "kimi variants": "claude/kimi hosts use engines/kimi/cc (KIMI_TMUX_*); codex host uses engines/kimi/cx (CX_KIMI_TMUX_*)."
+    "kimi variants": "Every host uses engines/kimi/cx (CX_KIMI_TMUX_*). engines/kimi/cc is legacy: not routed, not installed.",
+    "skill paths": "Claude skill follows CLAUDE_CONFIG_DIR; under cac run install.sh --host claude once per env."
   }
 }

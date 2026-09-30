@@ -32,9 +32,11 @@ CALL_IN_TMUX_HOST=codex call-in-tmux to <cursor|kimi> \
 ```bash
 CALL_IN_TMUX_HOST=codex call-in-tmux to <engine> --resume <id> -t followup -o /abs/new.report.md --brief /abs/followup.brief.md
 call-in-tmux list
-call-in-tmux kill --to <engine> done
+call-in-tmux kill --to <engine> <任务名>
 call-in-tmux matrix
 ```
+
+不要用 `kill … done` / `all`:登记表跨会话共享,会关掉别的会话的窗格。
 
 Codex app 找不到宿主 pane 时加 `--target %PANE`,或让其降级无头。
 

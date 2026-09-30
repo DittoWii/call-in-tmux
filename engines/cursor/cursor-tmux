@@ -385,10 +385,28 @@ deliver_now() {
             (sleep 0.2; tmux kill-pane -t "$pane" 2>/dev/null || true) &
         fi
     fi
-    wake_host "$title" "$report" "$pane"
     return 0
 }
 
+# TUI 下 stop hook 不一定触发(2026-09-30 实测 sessionStart/stop 都没来),session id 从 agent
+# transcript 反查:$CU_HOME/projects/<slug>/agent-transcripts/<chatId>/<chatId>.jsonl 含本次报告路径。
+discover_sid() {
+    local report="$1" f
+    [ -e "$report.stamp" ] || return 1
+    f=$(find "$CU_HOME/projects" -path '*/agent-transcripts/*' -name '*.jsonl' -newer "$report.stamp" 2>/dev/null \
+        | xargs -r grep -lF -- "$report" 2>/dev/null | head -1)
+    [ -n "$f" ] || return 1
+    basename -- "$f" .jsonl
+}
+
+synth_stop_payload() { # $1=report $2=workdir $3=client_type
+    local sid
+    sid=$(discover_sid "$1") || sid=""
+    python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id=sys.argv[1],cwd=sys.argv[2],client_type=sys.argv[3],status="completed")))' \
+        "$sid" "$2" "$3"
+}
+
+# 只在前台已按 --timeout 返回 124 之后调用:前台正常退出时宿主已由后台任务退出唤醒,再贴一次会变成多余的一轮对话。
 wake_host() {
     local title="$1" report="$2" child="${3:-}"
     local wake bin
@@ -659,12 +677,10 @@ case "${1:-}" in
         [ -s "$report" ] || { echo "报告为空: $report" >&2; exit 2; }
         if [ ! -e "$report.done" ]; then
             [ -s "$report.state" ] || write_state "$report" detached "manual-finish"
-            python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_late",status="completed")))' \
-                "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" pane "" 1; }
-        else
-            wake_host "$title" "$report" ""
+            deliver_now "$report" "$(synth_stop_payload "$report" "$workdir" cursor_agent_cli_late)" "$title" pane "" 1
         fi
         [ -e "$report.done" ] || exit 2
+        wake_host "$title" "$report" ""
         echo "[cx-cursor-tmux] 补交完成 report=$report"
         exit 0
         ;;
@@ -790,7 +806,7 @@ if [ -n "$brief_src" ]; then
     [ -s "$brief_src" ] || die "简报为空或不存在: $brief_src"
     for reserved in "$report" "$evidence" "$report.done" "$report.stop.json" "$report.latest.stop.json" \
         "$report.last.md" "$report.meta.json" "$report.state" "$report.notify.error" \
-        "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" "$report.gate" "$report.entry.log"; do
+        "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" "$report.gate" "$report.entry.log" "$report.linger.log"; do
         [ "$brief_src" != "$(realpath -m -- "$reserved")" ] || die "简报路径与输出文件冲突: $brief_src"
     done
 fi
@@ -800,7 +816,7 @@ rmdir "$report.claim" 2>/dev/null || true
 rm -f -- "$report" "$evidence" "$report.done" "$report.stop.json" "$report.latest.stop.json" \
     "$report.last.md" "$report.meta.json" "$report.state" "$report.notify.error" \
     "$report.pane.log" "$report.events.jsonl" "$report.launch.sh" "$report.stamp" \
-    "$report.gate" "$report.entry.log"
+    "$report.gate" "$report.entry.log" "$report.linger.log"
 [ "$brief_src" = "$report.brief" ] 2>/dev/null || rm -f -- "$report.brief"
 write_state "$report" starting "mode=$mode"
 atomic_touch "$report.stamp"
@@ -1068,8 +1084,7 @@ while [ ! -e "$report.done" ]; do
     if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
         sleep 1; [ -e "$report.done" ] && break
         if [ -s "$report" ]; then
-            python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_tui",status="completed")))' \
-                "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"; }
+            deliver_now "$report" "$(synth_stop_payload "$report" "$workdir" cursor_agent_cli_tui)" "$title" "$mode" "$close_pane" "$require_report"
             [ -e "$report.done" ] && break
         fi
         capture
@@ -1082,8 +1097,7 @@ while [ ! -e "$report.done" ]; do
     if [ -s "$report" ] && tui_idle; then
         idle_hits=$((idle_hits + 1))
         if [ "$idle_hits" -ge 2 ]; then
-            python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_tui_idle",status="completed")))' \
-                "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"; }
+            deliver_now "$report" "$(synth_stop_payload "$report" "$workdir" cursor_agent_cli_tui_idle)" "$title" "$mode" "$close_pane" "$require_report"
         fi
     else
         idle_hits=0
@@ -1105,23 +1119,23 @@ while [ ! -e "$report.done" ]; do
                 if [ "$dead" = 1 ] || [ "$dead" = gone ]; then
                     sleep 1
                     if [ -s "$report" ] && [ ! -e "$report.done" ]; then
-                        python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_tui",status="completed")))' \
-                            "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"; }
+                        deliver_now "$report" "$(synth_stop_payload "$report" "$workdir" cursor_agent_cli_tui)" "$title" "$mode" "$close_pane" "$require_report"
                     fi
                     break
                 fi
                 if [ -s "$report" ] && tui_idle; then
                     idle_hits=$((idle_hits + 1))
                     if [ "$idle_hits" -ge 2 ]; then
-                        python3 -c 'import json,sys; print(json.dumps(dict(hook_event_name="stop",session_id="",cwd=sys.argv[1],client_type="cursor_agent_cli_tui_idle",status="completed")))' \
-                            "$workdir" | { payload=$(cat); deliver_now "$report" "$payload" "$title" "$mode" "$close_pane" "$require_report"; }
+                        deliver_now "$report" "$(synth_stop_payload "$report" "$workdir" cursor_agent_cli_tui_idle)" "$title" "$mode" "$close_pane" "$require_report"
                     fi
                 else
                     idle_hits=0
                 fi
                 sleep 2
             done
-        ) >/tmp/cx-cursor-linger.$$.log 2>&1 &
+            # 不论谁交付的(stop hook 或上面的空闲检测),交付后都要唤醒宿主
+            [ -e "$report.done" ] && wake_host "$title" "$report" "$pane_id"
+        ) >"$report.linger.log" 2>&1 &
         disown || true
         exit 124
     fi

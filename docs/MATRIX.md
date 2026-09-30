@@ -6,7 +6,7 @@ Self-contained **host → engine** routing. Runners live only under this repo's 
 
 | From \\ To | codex | cursor | kimi |
 | --- | --- | --- | --- |
-| **claude** | ✅ `engines/codex` | ✅ `engines/cursor` | ✅ `engines/kimi/cc` |
+| **claude** | ✅ `engines/codex` | ✅ `engines/cursor` | ✅ `engines/kimi/cx` |
 | **codex** | — | ✅ `engines/cursor` | ✅ `engines/kimi/cx` |
 | **kimi** | — | ✅ `engines/cursor` | — |
 

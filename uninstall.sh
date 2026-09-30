@@ -33,6 +33,7 @@ done
 if [ "$HOOKS" = 1 ]; then
     python3 "$ROOT/engines/cursor/configure.py" uninstall --hooks-only 2>/dev/null || true
     python3 "$ROOT/engines/kimi/cx/configure.py" uninstall --hooks-only 2>/dev/null || true
+    # kimi/cc 已不再安装;保留清理,移除旧版本装过的 call-in-tmux-kimi-cc hook 块
     if [ -x "$ROOT/engines/kimi/cc/uninstall.sh" ]; then
         bash "$ROOT/engines/kimi/cc/uninstall.sh" 2>/dev/null || true
     fi
